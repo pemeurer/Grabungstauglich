@@ -1,0 +1,33 @@
+# --- Grabungsdaten: NIEMALS ins Repository ------------------------------
+# Fund-, Foto- und Stellenlisten enthalten Daten realer Grabungen.
+*.csv
+*.xls
+*.xlsx
+*.bak
+Fotos/
+*_Fotos/
+
+# --- Fotos und Rohdaten -------------------------------------------------
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.png
+
+# --- Vom Programm erzeugt ----------------------------------------------
+*.log
+rename_mapping.json
+
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+
+# --- Editoren / Betriebssystem -----------------------------------------
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

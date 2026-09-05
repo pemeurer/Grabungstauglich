@@ -1,0 +1,7 @@
+# Zeilenenden vereinheitlichen: im Repository LF, im Arbeitsordner passend zum System.
+* text=auto
+
+*.py  text eol=lf
+*.md  text eol=lf
+*.bat text eol=crlf
+LICENSE text eol=lf
