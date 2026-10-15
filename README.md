@@ -40,17 +40,54 @@ JPG-Dateien.
 - **Nur Fotoliste erstellen**, ohne Dateien anzufassen.
 - **Bestehende Digitalbildliste aktualisieren**. Vorhandene Kommentare bleiben
   erhalten, es werden nur fehlende Einträge ergänzt.
-- **Rückgängig machen**. Dateibewegungen werden zurückgenommen, veränderte
-  Listen aus den Sicherungskopien wiederhergestellt.
+- **Rückgängig machen**. Jeder Klick nimmt die letzte Aktion zurück:
+  Dateibewegungen werden zurückgenommen, Listen erhalten den Stand unmittelbar
+  vor dieser Aktion. Wurde eine Liste danach noch von Hand geändert, wird
+  dieser Stand vorher als `.vor-undo` gesichert. Überschrieben wird dabei
+  nichts: Liegt unter einem alten Fotonamen inzwischen ein anderes Foto,
+  kommt das zurückgeholte als `… (UNDO).jpg` daneben.
+
+## Keine doppelten Einträge
+
+Jede Kombination aus Aktivität, Stelle und Position steht höchstens einmal in
+der Fotoliste, auch wenn derselbe Ordner mehrfach bearbeitet wird. Mehrere
+Fotos derselben Stelle und Position (etwa `…_0005_010.jpg` und
+`…_0005_010_A.jpg`, oder ein liegengebliebenes Rohfoto neben der umbenannten
+Kopie) ergeben einen einzigen Eintrag. Doppelte Einträge, die schon in einer
+vorhandenen Liste stehen, führt das Programm auf Wunsch verlustfrei zusammen.
+Widersprechen sich ihre Angaben, bleiben beide Zeilen stehen und werden zum
+Prüfen genannt. Unterordner im fertigen Fotoordner, etwa `…_Fotos/aussortiert`,
+werden weder verschoben noch gelistet.
+
+Vorhandene Listen werden vollständig gelesen, auch wenn sie in Excel als
+UTF-8 gespeichert wurden, eine Zeile `sep=;` oder einen Titel über der
+Kopfzeile haben oder Zeilen ohne Stellennummer enthalten. Eigene
+Zusatzspalten, Notiz- und Trennzeilen bleiben erhalten und an ihrem Platz.
+Gesucht wird die Liste im Ordner der Maßnahme, in Nachbarordnern derselben
+Maßnahme (etwa `…_Abgabe`) und daneben. SfM-, Fund- und andere Listen werden
+nie als Fotoliste genommen, Kopien nur, wenn es keine bessere gibt.
+
+## Speichern
+
+Bevor eine Fotoliste geschrieben wird, erscheint immer ein Speichern-Dialog. Er
+zeigt die Zieldatei, die Zahl der neuen Einträge und gefundene Dopplungen. Über
+»Speicherort ändern…« lässt sich die Liste woanders speichern. Ist das Ziel eine
+vorhandene Fotoliste, wird sie ergänzt, nicht ersetzt. Vor jedem Überschreiben
+entsteht eine Sicherung (`.bak`).
 
 ## Einzel- und Batchmodus
 
 Im Einzelmodus wird ein Quellordner gewählt, die Aktivität ergänzt das Programm
 aus dem Ordnernamen oder den Nachbarordnern. Im Batchmodus genügt ein
 übergeordneter Ordner: Alle Maßnahmen darin werden erkannt und nacheinander
-abgearbeitet, jede mit eigenen Fotografennamen. Rückfragen beim Aktualisieren
-bestehender Listen beantwortet der Batchmodus selbsttätig mit Ersetzen und legt
-dabei Sicherungskopien an.
+abgearbeitet, jede mit eigenen Fotografennamen. Gehören mehrere Ordner zu
+einer Maßnahme, zeigt der Block sie einzeln zum Abwählen an. Eindeutige Kopien
+(`… - Kopie`, `(2)`, `Backup` oder ein anderer Ordner der Maßnahme mit
+angehängtem `_alt`) sind vorab abgewählt; Ortsnamen wie `Morschenich-Alt`
+gelten nicht als Kopie. Gespeichert wird
+im Batchmodus erst nach einem gemeinsamen Dialog, in dem jede Liste einzeln
+abgehakt wird. Würden zwei Maßnahmen in dieselbe Datei schreiben, verhindert
+das Programm das Speichern, bis der Konflikt gelöst ist.
 
 ## Fotografinnen und Fotografen
 

@@ -1,12 +1,17 @@
 import os
+import io
 import re
 import csv
+import stat
 import shutil
 import webbrowser
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from datetime import datetime
+
+# Spalten einer Fotoliste (WNK-Format), in dieser Reihenfolge für neue Listen
+FOTOLISTE_FIELDS = ["Aktivitaet", "StellenNr", "PosNr", "Fotograf", "FotoDatum", "Kommentar"]
 
 
 class PhotoRenamerApp:
@@ -23,6 +28,8 @@ class PhotoRenamerApp:
         self.rename_history = {}
         self.created_directories = []
         self.last_update_actions = []
+        self.undo_stack = []       # je Aktion eine Gruppe, siehe _begin_undo_group
+        self._chosen_targets = {}  # Aktivität -> zuletzt gespeicherte Fotoliste
 
         self.additional_photographers_entries_einzel = []
         self.batch_blocks = []
@@ -246,31 +253,31 @@ class PhotoRenamerApp:
 
         btn_g1 = tk.Button(inner_g, text="1. Umbenennen+Abgabe+Liste", width=_GW,
                            bg="#00cc44", fg="#000000", font=('Helvetica', 9, 'bold'),
-                           pady=2, command=self.action_full_process)
+                           pady=2, command=lambda: self.action_full_process(batch=True))
         btn_g1._custom_color = True
         btn_g1.grid(row=0, column=0, padx=3, pady=1)
 
         tk.Button(inner_g, text="2. Nur umbenennen", width=_GW,
                   bg=self.btn_bg_highlight, fg=self.fg_color,
                   font=('Helvetica', 9), pady=2,
-                  command=self.action_rename_only
+                  command=lambda: self.action_rename_only(batch=True)
                   ).grid(row=0, column=1, padx=3, pady=1)
 
         tk.Button(inner_g, text="3. Aufspüren + Liste", width=_GW,
                   bg=self.btn_bg_highlight, fg=self.fg_color,
                   font=('Helvetica', 9), pady=2,
-                  command=self.action_gather_and_csv
+                  command=lambda: self.action_gather_and_csv(batch=True)
                   ).grid(row=0, column=2, padx=3, pady=1)
 
         tk.Button(inner_g, text="4. Nur Fotoliste", width=_GW,
                   bg=self.btn_bg_highlight, fg=self.fg_color,
                   font=('Helvetica', 9), pady=2,
-                  command=self.action_csv_only
+                  command=lambda: self.action_csv_only(batch=True)
                   ).grid(row=1, column=0, padx=3, pady=1)
 
         btn_g5 = tk.Button(inner_g, text="5. Fotoliste aktualisieren", width=_GW,
                            bg="#4287f5", fg="#ffffff", font=('Helvetica', 9, 'bold'),
-                           pady=2, command=self.action_update_csv)
+                           pady=2, command=lambda: self.action_update_csv(batch=True))
         btn_g5._custom_color = True
         btn_g5.grid(row=1, column=1, padx=3, pady=1)
 
@@ -356,7 +363,7 @@ class PhotoRenamerApp:
             frame_actions,
             text="1. Umbenennen, Abgabeordner & Fotoliste erstellen",
             bg="#00cc44", fg="#000000", font=('Helvetica', 9, 'bold'),
-            relief="raised", pady=3, command=self.action_full_process)
+            relief="raised", pady=3, command=lambda: self.action_full_process(batch=False))
         btn_full._custom_color = True
         btn_full.grid(row=0, column=0, columnspan=2, padx=2, pady=(2, 3), sticky="ew")
 
@@ -364,25 +371,25 @@ class PhotoRenamerApp:
         tk.Button(
             frame_actions, text="2. Nur umbenennen",
             bg=self.btn_bg_highlight, fg=self.fg_color, pady=2,
-            command=self.action_rename_only
+            command=lambda: self.action_rename_only(batch=False)
         ).grid(row=1, column=0, padx=2, pady=1, sticky="ew")
 
         tk.Button(
             frame_actions, text="3. Fotos aufspüren, verschieben & Liste",
             bg=self.btn_bg_highlight, fg=self.fg_color, pady=2,
-            command=self.action_gather_and_csv
+            command=lambda: self.action_gather_and_csv(batch=False)
         ).grid(row=1, column=1, padx=2, pady=1, sticky="ew")
 
         tk.Button(
             frame_actions, text="4. Nur Fotoliste erstellen",
             bg=self.btn_bg_highlight, fg=self.fg_color, pady=2,
-            command=self.action_csv_only
+            command=lambda: self.action_csv_only(batch=False)
         ).grid(row=2, column=0, padx=2, pady=1, sticky="ew")
 
         btn_update = tk.Button(
             frame_actions, text="5. Fotoliste aktualisieren",
             bg="#4287f5", fg="#ffffff", font=('Helvetica', 9, 'bold'),
-            pady=2, command=self.action_update_csv)
+            pady=2, command=lambda: self.action_update_csv(batch=False))
         btn_update._custom_color = True
         btn_update.grid(row=2, column=1, padx=2, pady=1, sticky="ew")
 
@@ -477,9 +484,15 @@ class PhotoRenamerApp:
         return overrides
 
     def get_einzel_data(self):
+        # Pfad vereinheitlichen: ein abschließender Schrägstrich oder per
+        # "Als Pfad kopieren" eingefügte Anführungszeichen würden sonst Abgabe-
+        # ordner und Fotoliste an einem anderen Ort suchen bzw. anlegen.
+        base_dir = self.ent_dir_einzel.get().strip().strip('"').strip()
+        if base_dir:
+            base_dir = os.path.normpath(base_dir)
         return [{
             'raw_act': self.ent_activity_einzel.get(),
-            'base_dir': self.ent_dir_einzel.get(),
+            'base_dir': base_dir,
             'filter_raw': self.ent_filter_stellen_einzel.get(),
             'ignore_old_exif': self.var_ignore_exif_einzel.get(),
             'main_photo': self.ent_main_photo_einzel.get().strip(),
@@ -488,13 +501,40 @@ class PhotoRenamerApp:
                 self.additional_photographers_entries_einzel)
         }]
 
+    @staticmethod
+    def _block_extra_dirs(block):
+        """Die angehakten zusammengeführten Ordner eines Batch-Blocks."""
+        if 'extra_vars' in block:
+            return [xd for xd, var in block['extra_vars'] if var.get()]
+        return list(block.get('extra_dirs', []))
+
+    @staticmethod
+    def _block_skipped_dirs(block):
+        """Die abgewählten zusammengeführten Ordner eines Batch-Blocks."""
+        return [xd for xd, var in block.get('extra_vars', []) if not var.get()]
+
+    def _skipped_notes(self, data_list):
+        """Hinweis auf abgewählte Ordner für Protokoll und Abschlussmeldung –
+        damit 'aktuell' nicht verschweigt, dass Fotos liegen geblieben sind."""
+        notes = []
+        for d in data_list:
+            for xd in d.get('skipped_dirs', []):
+                n = len(self.gather_all_photos(xd)) if os.path.isdir(xd) else 0
+                notes.append(f"{(d.get('raw_act') or '').strip()}: Ordner "
+                             f"'{os.path.basename(xd)}' nicht einbezogen (abgewählt, "
+                             f"{self._n(n, 'Foto', 'Fotos')}).")
+        for n in notes:
+            self.log(n)
+        return notes
+
     def get_batch_data(self):
         data_list = []
         for block in self.batch_blocks:
             data_list.append({
                 'raw_act': block['ent_activity'].get(),
                 'base_dir': block['base_dir'],
-                'extra_dirs': block.get('extra_dirs', []),
+                'extra_dirs': self._block_extra_dirs(block),
+                'skipped_dirs': self._block_skipped_dirs(block),
                 'filter_raw': self.ent_filter_stellen_batch.get(),
                 'ignore_old_exif': self.var_ignore_exif_batch.get(),
                 'main_photo': block['ent_main_photo'].get().strip(),
@@ -583,11 +623,19 @@ class PhotoRenamerApp:
 
                 for g in groups.values():
                     dirs = g['dirs']
-                    # Primary folder: prefer one ending in _Abgabe, else first alphabetically
+                    # Primary folder: prefer one ending in _Abgabe, else first
+                    # alphabetically – but never a copy/backup if there is
+                    # another candidate ('OV_..._alt' before 'OV_..._neu').
+                    # Ein '<Aktivität>_Fotos'-Ordner (Ausgabe eines früheren
+                    # Laufs) ist Ziel, nie Hauptordner – sonst wechselt der
+                    # Hauptordner beim erneuten Scannen.
+                    cands = [d for d in dirs if not self._looks_like_copy_dir(d, dirs)] or dirs
+                    cands = [d for d in cands
+                             if not os.path.basename(d).lower().endswith('_fotos')] or cands
                     primary = next(
-                        (d for d in dirs
+                        (d for d in cands
                          if os.path.basename(d).lower().endswith('_abgabe')),
-                        dirs[0])
+                        cands[0])
                     extra = [d for d in dirs if d != primary]
                     self.create_batch_block(primary, g['act'], extra_dirs=extra)
                     found_count += 1
@@ -628,7 +676,8 @@ class PhotoRenamerApp:
             return {
                 'raw_act': block['ent_activity'].get(),
                 'base_dir': dir_path,
-                'extra_dirs': block['extra_dirs'],
+                'extra_dirs': self._block_extra_dirs(block),
+                'skipped_dirs': self._block_skipped_dirs(block),
                 'filter_raw': self.ent_filter_stellen_batch.get(),
                 'ignore_old_exif': self.var_ignore_exif_batch.get(),
                 'main_photo': block['ent_main_photo'].get().strip(),
@@ -667,6 +716,39 @@ class PhotoRenamerApp:
         btn_del._custom_color = True
         btn_del.grid(row=0, column=5, padx=(6, 2), sticky="e")
 
+        # ── Row 1b: zusammengeführte weitere Ordner – sichtbar und abwählbar.
+        # Ordner, die nach Kopie/Sicherung aussehen ('… - Kopie', '_alt'),
+        # sind vorab abgewählt: ihre Fotos würden sonst als _A-Dubletten
+        # umbenannt und doppelt aufgespürt.
+        block['extra_vars'] = []
+        p_, y_, n_ = self.parse_activity(suggested_act)
+        t_key = (self._path_key(self.get_output_folder_path(dir_path, f"{p_}_{y_}_{n_}"))
+                 if p_ else None)
+        if extra_dirs:
+            x_frame = tk.Frame(b_frame, bg=self.bg_color)
+            x_frame.pack(fill="x")
+            tk.Label(x_frame, text="Weitere Ordner dieser Maßnahme einbeziehen:",
+                     bg=self.bg_color, fg=self.fg_color).pack(anchor="w")
+            for xd in extra_dirs:
+                if self._path_key(xd) == t_key:
+                    # Das ist der Zielordner der fertigen Fotos – immer dabei.
+                    tk.Label(x_frame, text=f"   {os.path.basename(xd)}   (Zielordner "
+                                           "der fertigen Fotos – immer einbezogen)",
+                             bg=self.bg_color, fg=self.fg_color).pack(anchor="w", padx=(14, 0))
+                    block['extra_vars'].append((xd, tk.BooleanVar(value=True)))
+                    continue
+                looks_copy = self._looks_like_copy_dir(xd, [dir_path] + extra_dirs)
+                var = tk.BooleanVar(value=not looks_copy)
+                tk.Checkbutton(
+                    x_frame, variable=var,
+                    text=os.path.basename(xd) + (
+                        "   ⚠ sieht nach Kopie/Sicherung aus – vorsorglich abgewählt"
+                        if looks_copy else ""),
+                    bg=self.bg_color, fg=self.fg_color, selectcolor=self.entry_bg,
+                    activebackground=self.bg_color, activeforeground=self.fg_color
+                ).pack(anchor="w", padx=(14, 0))
+                block['extra_vars'].append((xd, var))
+
         # ── Row 2: optional photographer canvas ───────────────────────────────
         c_frame = tk.Frame(b_frame, bg=self.bg_color)
         c_frame.pack(fill="x", pady=2)
@@ -689,31 +771,31 @@ class PhotoRenamerApp:
         btn1 = tk.Button(btn_frame,
                          text="1. Umbenennen+Abgabe+Liste", width=_BW,
                          bg="#00cc44", fg="#000000", font=('Helvetica', 8, 'bold'), pady=1,
-                         command=lambda: self.action_full_process([_block_data()]))
+                         command=lambda: self.action_full_process([_block_data()], batch=True))
         btn1._custom_color = True
         btn1.grid(row=0, column=0, padx=2, pady=1)
 
         tk.Button(btn_frame, text="2. Nur umbenennen", width=_BW,
                   bg=self.btn_bg_highlight, fg=self.fg_color,
                   font=('Helvetica', 8), pady=1,
-                  command=lambda: self.action_rename_only([_block_data()])
+                  command=lambda: self.action_rename_only([_block_data()], batch=True)
                   ).grid(row=0, column=1, padx=2, pady=1)
 
         tk.Button(btn_frame, text="3. Aufspüren + Liste", width=_BW,
                   bg=self.btn_bg_highlight, fg=self.fg_color,
                   font=('Helvetica', 8), pady=1,
-                  command=lambda: self.action_gather_and_csv([_block_data()])
+                  command=lambda: self.action_gather_and_csv([_block_data()], batch=True)
                   ).grid(row=0, column=2, padx=2, pady=1)
 
         tk.Button(btn_frame, text="4. Nur Fotoliste", width=_BW,
                   bg=self.btn_bg_highlight, fg=self.fg_color,
                   font=('Helvetica', 8), pady=1,
-                  command=lambda: self.action_csv_only([_block_data()])
+                  command=lambda: self.action_csv_only([_block_data()], batch=True)
                   ).grid(row=1, column=0, padx=2, pady=1)
 
         btn5 = tk.Button(btn_frame, text="5. Fotoliste aktualisieren", width=_BW,
                          bg="#4287f5", fg="#ffffff", font=('Helvetica', 8, 'bold'), pady=1,
-                         command=lambda: self.action_update_csv([_block_data()]))
+                         command=lambda: self.action_update_csv([_block_data()], batch=True))
         btn5._custom_color = True
         btn5.grid(row=1, column=1, padx=2, pady=1)
 
@@ -727,17 +809,29 @@ class PhotoRenamerApp:
     # =========================================================================
     # CORE ROUTING
     # =========================================================================
-    def _get_active_data(self):
-        idx = self.notebook.index(self.notebook.select())
-        if idx == 0:
-            return self.get_einzel_data()
-        elif idx == 1:
-            return self.get_batch_data()
-        return []
-
-    def action_full_process(self, data_list=None):
+    def _resolve_data(self, data_list, batch):
+        """Daten und Modus einer Aktion. Die Knöpfe geben den Modus ausdrücklich
+        mit; nur ohne Angabe wird der sichtbare Reiter herangezogen. Jede
+        Aktion beginnt einen eigenen UNDO-Schritt."""
+        if batch is None:
+            batch = self.notebook.index(self.notebook.select()) == 1
         if data_list is None:
-            data_list = self._get_active_data()
+            data_list = self.get_batch_data() if batch else self.get_einzel_data()
+        self._begin_undo_group()
+        return data_list, batch
+
+    @staticmethod
+    def _notes_text(notes, limit=15):
+        """Ergebniszeilen (Fotolisten, abgewählte Ordner) für die Abschlussmeldung."""
+        if not notes:
+            return ""
+        text = "\n\nErgebnis:\n- " + "\n- ".join(notes[:limit])
+        if len(notes) > limit:
+            text += f"\n… und {len(notes) - limit} weitere (siehe Protokoll)"
+        return text
+
+    def action_full_process(self, data_list=None, batch=None):
+        data_list, batch = self._resolve_data(data_list, batch)
         if not data_list:
             return messagebox.showwarning("Achtung", "Keine Daten vorhanden.")
         t_r, t_m = 0, 0
@@ -746,24 +840,30 @@ class PhotoRenamerApp:
             if res:
                 t_r += res[0]
                 t_m += res[1]
-            self._core_create_wnk_csv(silent=True, **d)
+        notes = self._skipped_notes(data_list) + self._csv_save_flow(data_list, batch)
         messagebox.showinfo("Aktion 1 beendet",
                             f"Vorgang für {len(data_list)} Ordner abgeschlossen.\n\n"
-                            f"Neu umbenannt: {t_r}\nBereits fertige verschoben: {t_m}")
+                            f"Neu umbenannt: {t_r}\nBereits fertige verschoben: {t_m}"
+                            + self._notes_text(notes))
 
-    def action_rename_only(self, data_list=None):
-        if data_list is None:
-            data_list = self._get_active_data()
+    def action_rename_only(self, data_list=None, batch=None):
+        data_list, batch = self._resolve_data(data_list, batch)
         if not data_list:
             return
-        t_r = sum((self._core_process_photos("rename_only", **d) or (0, 0))[0]
-                  for d in data_list)
+        t_r, notes = 0, self._skipped_notes(data_list)
+        for d in data_list:
+            res = self._core_process_photos("rename_only", **d)
+            if res is None:
+                notes.append(f"{(d.get('raw_act') or '').strip() or '?'}: "
+                             "Aktivität oder Ordner ungültig – übersprungen.")
+            else:
+                t_r += res[0]
         messagebox.showinfo("Aktion 2 beendet",
-                            f"Nur Umbenennen abgeschlossen!\n\nNeu umbenannt: {t_r} Fotos.")
+                            f"Nur Umbenennen abgeschlossen!\n\nNeu umbenannt: {t_r} Fotos."
+                            + self._notes_text(notes))
 
-    def action_gather_and_csv(self, data_list=None):
-        if data_list is None:
-            data_list = self._get_active_data()
+    def action_gather_and_csv(self, data_list=None, batch=None):
+        data_list, batch = self._resolve_data(data_list, batch)
         if not data_list:
             return
         t_m = 0
@@ -771,56 +871,62 @@ class PhotoRenamerApp:
             m = self._core_move_to_existing(**d)
             if m is not None:
                 t_m += m
-            self._core_create_wnk_csv(silent=True, **d)
+        notes = self._skipped_notes(data_list) + self._csv_save_flow(data_list, batch)
         messagebox.showinfo("Aktion 3 beendet",
-                            f"Aufspüren & Listen erstellt!\n\n"
-                            f"Fotos in Abgabeordner verschoben: {t_m}")
+                            f"Aufspüren abgeschlossen!\n\n"
+                            f"Fotos in Abgabeordner verschoben: {t_m}"
+                            + self._notes_text(notes))
 
-    def action_csv_only(self, data_list=None):
-        if data_list is None:
-            data_list = self._get_active_data()
-        for d in data_list:
-            self._core_create_wnk_csv(silent=False, **d)
+    def action_csv_only(self, data_list=None, batch=None):
+        data_list, batch = self._resolve_data(data_list, batch)
+        if not data_list:
+            return messagebox.showwarning("Achtung", "Keine Daten vorhanden.")
+        notes = self._skipped_notes(data_list) + self._csv_save_flow(data_list, batch)
+        messagebox.showinfo("Aktion 4 beendet",
+                            "Fotoliste erstellen abgeschlossen." + self._notes_text(notes))
 
-    def action_update_csv(self, data_list=None):
-        if data_list is not None:
-            # Per-block call from batch block button: auto-find CSV
-            for d in data_list:
-                prefix, year, proj_str = self.parse_activity(d['raw_act'])
-                if not prefix:
-                    continue
-                act_norm = f"{prefix}_{year}_{proj_str}"
-                exp_csv = self._find_existing_csv(
-                    d['base_dir'], act_norm,
-                    extra_dirs=d.get('extra_dirs', []))
-                if exp_csv and os.path.exists(exp_csv):
-                    self._core_update_csv_logic(exp_csv, **d)
-                else:
-                    self.log(f"Keine Fotoliste gefunden für {act_norm}.")
-            messagebox.showinfo("Fotoliste aktualisiert", "Abgeschlossen.")
+    def action_update_csv(self, data_list=None, batch=None):
+        data_list, batch = self._resolve_data(data_list, batch)
+        if not data_list:
+            return messagebox.showwarning("Achtung", "Keine Daten vorhanden.")
+        if batch:
+            # Batch: vorhandene Listen werden je Maßnahme gesucht; gespeichert
+            # wird erst nach Bestätigung im Speichern-Dialog.
+            notes = (self._skipped_notes(data_list)
+                     + self._csv_save_flow(data_list, True, update=True))
+            messagebox.showinfo("Fotolisten aktualisieren", "Batch-Aktualisierung "
+                                "abgeschlossen." + self._notes_text(notes))
             return
-        # Global call from Einzel-Modus action frame
-        idx = self.notebook.index(self.notebook.select())
-        if idx == 0:
-            fp = filedialog.askopenfilename(
-                title="Vorhandene Fotoliste auswählen",
-                filetypes=[("CSV Dateien", "*.csv")])
-            if fp:
-                self._core_update_csv_logic(fp, **self.get_einzel_data()[0])
-        elif idx == 1:
-            for d in self.get_batch_data():
-                prefix, year, proj_str = self.parse_activity(d['raw_act'])
-                if not prefix:
-                    continue
-                act_norm = f"{prefix}_{year}_{proj_str}"
-                exp_csv = self._find_existing_csv(
-                    d['base_dir'], act_norm,
-                    extra_dirs=d.get('extra_dirs', []))
-                if exp_csv and os.path.exists(exp_csv):
-                    self._core_update_csv_logic(exp_csv, **d)
-                else:
-                    self.log(f"Batch-Update übersprungen: Keine Fotoliste gefunden für {act_norm}.")
-            messagebox.showinfo("Batch Update", "Batch-Aktualisierung abgeschlossen.")
+        # Einzel: die zu aktualisierende Liste auswählen (Vorschlag: die
+        # automatisch gefundene), danach Speicherort im Speichern-Dialog.
+        d = data_list[0]
+        p, y, pr = self.parse_activity(d.get('raw_act', ''))
+        if not p or not os.path.isdir(d.get('base_dir', '')):
+            return messagebox.showwarning(
+                "Achtung", "Bitte zuerst eine gültige Aktivität und einen Quell-Ordner angeben.")
+        # Vorschlag: in dieser Sitzung selbst gewählte Liste, sonst die gefundene
+        pinned = self._chosen_targets.get(
+            (self._activity_key(f"{p} {y}/{int(pr)}"), self._path_key(d['base_dir'])))
+        guess = (pinned if pinned and os.path.isfile(pinned)
+                 else self._find_existing_csv(d['base_dir'], f"{p}_{y}_{pr}",
+                                              extra_dirs=d.get('extra_dirs', [])))
+        fp = filedialog.askopenfilename(
+            title="Vorhandene Fotoliste auswählen",
+            initialdir=os.path.dirname(guess) if guess else d['base_dir'],
+            initialfile=os.path.basename(guess) if guess else "",
+            filetypes=[("CSV Dateien", "*.csv")])
+        if not fp:
+            return
+        fp = os.path.normpath(fp)
+        info = self._inspect_csv(fp)
+        if not info or not info['compatible']:
+            return messagebox.showerror(
+                "Keine Fotoliste",
+                f"'{os.path.basename(fp)}' lässt sich nicht als Fotoliste lesen\n"
+                "(die Spalten StellenNr und PosNr fehlen).")
+        notes = self._csv_save_flow([d], False, list_path=fp, update=True)
+        messagebox.showinfo("Fotoliste aktualisieren",
+                            "Aktualisieren abgeschlossen." + self._notes_text(notes))
 
     # =========================================================================
     # CORE LOGIK
@@ -920,13 +1026,41 @@ class PhotoRenamerApp:
             pass
         return None
 
-    def get_output_folder_path(self, base_dir, activity_str):
+    def get_output_folder_path(self, base_dir, activity_str, exclude=None):
         # If a matching _Fotos subdirectory already exists INSIDE base_dir, use that.
         # This handles structures like OV_2026_1014_Abgabe/OV_2026_1014_Fotos/.
         inner = os.path.join(base_dir, f"{activity_str}_Fotos")
         if os.path.isdir(inner):
             return inner
-        return os.path.join(os.path.dirname(base_dir), f"{activity_str}_Fotos")
+        parent = os.path.dirname(base_dir)
+        sibling = os.path.join(parent, f"{activity_str}_Fotos")
+        if (not os.path.isdir(sibling)
+                and not os.path.basename(base_dir).lower().endswith('_abgabe')):
+            # Liegt daneben schon GENAU EIN Abgabeordner derselben Maßnahme mit
+            # _Fotos (z.B. erst Batch, dann Einzel auf dem Rohfoto-Ordner), wird
+            # der weiterverwendet statt ein zweiter angelegt. Sein Name muss mit
+            # der Aktivität beginnen und darf keine Kopie/Sicherung und nicht im
+            # Batch abgewählt sein; bei mehreren Kandidaten bleibt es beim
+            # Ordner neben der Quelle. Ist die Quelle selbst ein Abgabeordner,
+            # bekommt sie ihren eigenen _Fotos-Ordner.
+            act_key = self._activity_key(activity_str)
+            excluded = {self._path_key(x) for x in (exclude or [])}
+            found = []
+            try:
+                for item in sorted(os.listdir(parent)):
+                    cand = os.path.join(parent, item, f"{activity_str}_Fotos")
+                    p, y, n = self.search_activity_in_string(item)
+                    if (item.lower().endswith('_abgabe') and os.path.isdir(cand)
+                            and p and self._activity_key(f"{p} {y}/{n}") == act_key
+                            and not self._looks_like_copy_dir(item, [base_dir])
+                            and self._path_key(os.path.join(parent, item))
+                            not in excluded | {self._path_key(base_dir)}):
+                        found.append(cand)
+            except Exception:
+                pass
+            if len(found) == 1:
+                return found[0]
+        return sibling
 
     def get_unique_filename(self, target_dir, base_name, ext, source_filepath=None):
         c = 0
@@ -942,19 +1076,24 @@ class PhotoRenamerApp:
             c += 1
         return cand
 
-    def gather_all_photos(self, base_dir, skip_dir_names=None):
-        """Walk base_dir recursively, optionally skipping subdirs by name."""
+    def gather_all_photos(self, base_dir, skip_dir_names=None, flat_dirs=None):
+        """Walk base_dir recursively, optionally skipping subdirs by name.
+        flat_dirs: in diese Ordner (den Abgabe-Fotoordner) wird nur ihre
+        oberste Ebene gelesen – Unterordner wie 'aussortiert' bleiben draußen."""
         skip_lower = {s.lower() for s in (skip_dir_names or [])}
+        flat = {self._path_key(d) for d in (flat_dirs or [])}
         result = []
         for root, dirs, files in os.walk(base_dir):
             # Prune directories to skip (modifying dirs in-place stops os.walk from descending)
             dirs[:] = [d for d in dirs if d.lower() not in skip_lower]
+            if self._path_key(root) in flat:
+                dirs[:] = []
             for f in files:
                 if f.lower().endswith(('.jpg', '.jpeg')):
                     result.append(os.path.join(root, f))
         return result
 
-    def _get_default_csv_path(self, base_dir, act_norm):
+    def _get_default_csv_path(self, base_dir, act_norm, exclude=None):
         """Default path for a newly created Fotoliste.
 
         Abgabe-type structure (base_dir contains an inner _Fotos subfolder):
@@ -963,13 +1102,15 @@ class PhotoRenamerApp:
         Simple structure or standalone _Fotos folder:
           → put CSV next to base_dir (sibling).
         """
-        t_dir = self.get_output_folder_path(base_dir, act_norm)
-        # Abgabe-type: t_dir is a direct child of base_dir
-        if os.path.abspath(os.path.dirname(t_dir)) == os.path.abspath(base_dir):
+        t_dir = self.get_output_folder_path(base_dir, act_norm, exclude=exclude)
+        # Abgabe-type: t_dir lies inside an Abgabe folder (base_dir itself or a
+        # sibling Abgabe folder of the same activity, see get_output_folder_path)
+        abgabe = os.path.dirname(t_dir)
+        if self._path_key(abgabe) != self._path_key(os.path.dirname(base_dir)):
             # Look for an existing *Stellenkatalog* or *Listen* subdirectory
             try:
-                for item in sorted(os.listdir(base_dir)):
-                    sub = os.path.join(base_dir, item)
+                for item in sorted(os.listdir(abgabe)):
+                    sub = os.path.join(abgabe, item)
                     if os.path.isdir(sub):
                         lc = item.lower()
                         if 'stellenkatalog' in lc or 'listen' in lc:
@@ -977,57 +1118,202 @@ class PhotoRenamerApp:
             except Exception:
                 pass
             # None found — use standard name (will be created on save)
-            return os.path.join(base_dir,
+            return os.path.join(abgabe,
                                 f"{act_norm}_Stellenkatalog_und_Listen",
                                 f"{act_norm}_Fotoliste.csv")
         # Simple structure: sibling of base_dir
         return os.path.join(os.path.dirname(base_dir), f"{act_norm}_Fotoliste.csv")
 
-    def _find_existing_csv(self, base_dir, act_norm, extra_dirs=None):
-        """Search for an existing compatible Fotoliste CSV.
+    # Eindeutige Kopie-Merkmale, nur als ganzes Wort: '… - Kopie', 'Kopie von
+    # …', 'Copy', 'Backup', 'NEU_…' aus älteren Programmfassungen. Nicht:
+    # 'Fotos_kopiert', 'Hangsicherung'. _COPY_HINT zählt zusätzlich '_alt',
+    # '_old', 'Sicherung' und '(2)' als Wort; es dient nur der Rangfolge bei der
+    # Listensuche ('Morschenich-Alt' ist ein Ort, 'Fläche (2)' eine Teilfläche).
+    _STRONG_COPY_HINT = re.compile(
+        r"(?:^|[\s_\-])(?:kopie|copy|backup|sicherungskopie)(?=[\s_\-.(]|$)|^neu_",
+        re.IGNORECASE)
+    _COPY_HINT = re.compile(
+        _STRONG_COPY_HINT.pattern
+        + r"|(?:^|[\s_\-])(?:alt|old|sicherung|bak)(?=[\s_\-.]|$)|\(\d+\)",
+        re.IGNORECASE)
+    # Ordnername endet auf ein Kopie-Wort: 'OV_2022_1057_alt', '…_Abgabe_bak'
+    # ('vorher' nicht – Vorher-/Nachher-Fotos sind übliche Dokumentation)
+    _COPY_SUFFIX = re.compile(
+        r"[\s_\-]+(?:alt|old|sicherung|backup|bak|kopie|copy)(?:\s*\(\d+\))?[\s_\-]*$",
+        re.IGNORECASE)
+    # Windows-Doppel 'Ordner (2)': Kopie nur, wenn 'Ordner' selbst danebenliegt
+    _NUM_SUFFIX = re.compile(r"\s*\(\d+\)\s*$")
+    # Listen anderer Art; 'sfm' auch mit 'Foto' im Namen (SfM-Fotoliste),
+    # 'Fundfoto' aber nicht als Teil von 'Befundfoto'
+    _OTHER_LIST_HINT = re.compile(
+        r"sfm|fund|zeichn|skizz|vermess|probe|befund|nivell|stellenliste|stellenkatalog",
+        re.IGNORECASE)
+    _NEVER_FOTOLISTE = re.compile(r"sfm|(?<!be)fundfoto", re.IGNORECASE)
 
-        Searches base_dir, its parent, all their immediate subdirs, and any
-        extra_dirs (merged sibling folders for the same activity) + their subdirs.
-        """
-        parts = act_norm.split('_')
-        act_wnk = (f"{parts[0]} {parts[1]}/{int(parts[2])}"
-                   if len(parts) == 3 else act_norm)
+    def _looks_like_copy_dir(self, path, group):
+        """Ist dieser Ordner wohl eine Kopie/Sicherung? Nur bei eindeutigen
+        Merkmalen ('… - Kopie', 'Kopie von …', 'Backup') oder wenn der Name ein
+        anderer Ordner der Gruppe bzw. nur die Aktivität (+ Abgabe/Fotos) mit
+        angehängtem '_alt', '_Sicherung', '_bak', '(2)' … ist. Orte und Anlässe
+        wie 'Morschenich-Alt', 'Hangsicherung', 'Sicherung_Stadtmauer',
+        'Fläche (2)' oder 'Fotos_kopiert' gelten nicht als Kopie."""
+        name = os.path.basename(os.path.normpath(path))
+        if self._STRONG_COPY_HINT.search(name) or re.fullmatch(
+                r"\s*(?:alt|old|sicherung(?:en)?|backups?|bak|kopien?|archiv)\s*",
+                name, re.IGNORECASE):
+            return True
+        others = {os.path.basename(os.path.normpath(g)).lower()
+                  for g in group if self._path_key(g) != self._path_key(path)}
+        n = self._NUM_SUFFIX.search(name)
+        if n:
+            return name[:n.start()].lower() in others
+        m = self._COPY_SUFFIX.search(name)
+        if not m:
+            return False
+        stem = name[:m.start()]
+        if stem.lower() in others:
+            return True
+        rest = re.sub(r"^[A-Za-z]{2}[\s_/-]?(?:[0-9]{4}|[0-9]{2})[\s_/-]?[0-9]{1,4}", "", stem)
+        return rest.strip(" _-").lower() in ('', 'abgabe', 'fotos', 'foto', 'bilder',
+                                             'grabung', 'doku', 'dokumentation')
 
-        parent = os.path.dirname(base_dir)
+    def _path_looks_like_copy(self, path, levels=3):
+        """Liegt eine Datei in einem Kopie-/Sicherungsordner oder heißt so?
+        Geprüft werden der Dateiname und die letzten Ordnerebenen."""
+        parts, cur = [], path
+        for _ in range(levels):
+            parts.append(os.path.basename(cur))
+            nxt = os.path.dirname(cur)
+            if not nxt or nxt == cur:
+                break
+            cur = nxt
+        if self._COPY_HINT.search(parts[0]):
+            return True
+        return any(self._looks_like_copy_dir(p, []) for p in parts[1:] if p)
 
-        dirs_to_search: list[str] = []
-        for root in [base_dir, parent] + list(extra_dirs or []):
-            if os.path.isdir(root) and root not in dirs_to_search:
-                dirs_to_search.append(root)
-                try:
-                    for item in os.listdir(root):
-                        sub = os.path.join(root, item)
-                        if os.path.isdir(sub) and sub not in dirs_to_search:
-                            dirs_to_search.append(sub)
-                except Exception:
-                    pass
+    def _list_search_dirs(self, base_dir, act_key, extra_dirs, skip_dirs=None):
+        """Ordner für die Listensuche als (Ordner, Tiefe, gehört_zur_Maßnahme,
+        Suchwurzel). Wurzel der Maßnahme ist der höchste Ordner bis drei Ebenen
+        über base_dir, dessen Name die Aktivität trägt; sie, die
+        zusammengeführten Ordner und Nachbarordner mit derselben Aktivität im
+        Namen (z.B. '…_Abgabe' neben dem Rohfoto-Ordner) werden bis drei Ebenen
+        tief durchsucht (Abgabe/…_Stellenkatalog_und_Listen/), der Ordner
+        darüber eine Ebene."""
+        act_root, cur = base_dir, base_dir
+        for _ in range(3):
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            if self._activity_in_text(os.path.basename(parent)) == act_key:
+                act_root = parent
+            cur = parent
+        out = []
+        skip = {self._path_key(s) for s in (skip_dirs or [])}  # im Batch abgewählt
+        seen = set(skip)
 
-        # Two passes: first prefer files whose name contains act_norm
-        for priority_filter in [True, False]:
-            for d in dirs_to_search:
-                try:
-                    for f in sorted(os.listdir(d)):
-                        if not f.lower().endswith('.csv'):
-                            continue
-                        if priority_filter and act_norm.lower() not in f.lower():
-                            continue
-                        fp = os.path.join(d, f)
-                        if not self._csv_is_compatible(fp):
-                            continue
-                        match = self._csv_activity_matches(fp, act_wnk)
-                        if match is True or match is None:
-                            return fp
-                        # match is False: structure fits but activity differs — warn and skip
-                        self.log(f"⚠ CSV übersprungen (andere Aktivität?): "
-                                 f"{os.path.relpath(fp, parent)}")
-                except Exception:
-                    pass
-        return None
+        def add(root, max_depth, own, rel_root):
+            # rel_root: ab hier zählen Ordnernamen für Tiefe und Kopie-Erkennung
+            if not root or not os.path.isdir(root) or self._path_key(root) in skip:
+                return
+            for cur_dir, dirs, _ in os.walk(root):
+                # Unterordner einer ANDEREN Maßnahme (z.B. 'OV_2026_0006_Abgabe'
+                # im Ordner von 0005) gehören nicht dazu
+                dirs[:] = [x for x in dirs
+                           if self._path_key(os.path.join(cur_dir, x)) not in skip
+                           and self._activity_in_text(x) in (None, act_key)]
+                rel = os.path.relpath(cur_dir, root)
+                if (0 if rel == '.' else rel.count(os.sep) + 1) >= max_depth:
+                    dirs[:] = []
+                k = self._path_key(cur_dir)
+                if k not in seen:
+                    seen.add(k)
+                    out.append((cur_dir, own, rel_root))
+
+        add(act_root, 3, True, act_root)
+        top = os.path.dirname(act_root)
+        for x in extra_dirs or []:
+            add(x, 3, True, os.path.dirname(x))
+        try:
+            for item in sorted(os.listdir(top)):
+                sib = os.path.join(top, item)
+                p, y, n = self.search_activity_in_string(item)  # Name BEGINNT mit Aktivität
+                if (os.path.isdir(sib) and p
+                        and self._activity_key(f"{p} {y}/{n}") == act_key
+                        and not self._looks_like_copy_dir(sib, [act_root])):
+                    add(sib, 3, True, top)
+        except Exception:
+            pass
+        add(top, 1, False, top)
+        return out
+
+    def _find_existing_csv(self, base_dir, act_norm, extra_dirs=None, skip_dirs=None):
+        """Sucht die vorhandene Fotoliste dieser Aktivität.
+
+        Infrage kommen nur Listen mit den Spalten StellenNr und PosNr, die nach
+        einer Fotoliste aussehen ('foto'/'bild' im Namen oder Spalte Fotograf/
+        FotoDatum) – Fund-, SfM- (auch 'SfM-Fotoliste'), Zeichnungs- oder
+        Stellenlisten scheiden aus. Listen mit Einträgen nur ANDERER
+        Aktivitäten ebenso; eine Liste ohne Aktivitätsangabe nur, wenn ihr Name
+        die Aktivität trägt oder sie im Ordner der Maßnahme selbst liegt (keine
+        fremde Vorlage im Sammelordner). Rangfolge: Einträge genau dieser
+        Aktivität, Standardort des Programms, keine Kopie/Sicherung, passender
+        Name, Name nach Art 'Fotoliste'/'Digitalbildliste', möglichst weit oben."""
+        act_key = self._activity_key(act_norm)
+        default = self._path_key(self._get_default_csv_path(base_dir, act_norm,
+                                                            exclude=skip_dirs))
+        # Liegen die fertigen Fotos in einem Abgabeordner, gehört die Liste
+        # bevorzugt dorthin (vor gleichwertigen Listen in Nachbarordnern)
+        abg = os.path.dirname(self.get_output_folder_path(base_dir, act_norm,
+                                                          exclude=skip_dirs))
+        abg_key = (self._path_key(abg) + os.sep
+                   if self._path_key(abg) != self._path_key(os.path.dirname(base_dir))
+                   else None)
+        best, best_score, order = None, None, 0
+        for d, own, rel_root in self._list_search_dirs(base_dir, act_key, extra_dirs,
+                                                       skip_dirs):
+            try:
+                files = sorted(os.listdir(d))
+            except Exception:
+                continue
+            for f in files:
+                if not f.lower().endswith('.csv'):
+                    continue
+                lname = f.lower()
+                named_foto = 'foto' in lname or 'bild' in lname
+                if self._NEVER_FOTOLISTE.search(f) or (
+                        not named_foto and self._OTHER_LIST_HINT.search(f)):
+                    continue
+                fp = os.path.join(d, f)
+                info = self._inspect_csv(fp)
+                if not info or not info['compatible']:
+                    continue
+                if not (named_foto or info['fotocols']):
+                    continue
+                name_act = self._activity_in_text(f)
+                acts = info['activities']
+                own_rows = act_key in acts
+                if acts and not own_rows:
+                    # Liste einer anderen Maßnahme. Nur melden, wenn der Name
+                    # das nicht ohnehin verrät.
+                    if name_act is None or name_act == act_key:
+                        self.log(f"⚠ CSV übersprungen (Einträge anderer Aktivität): {fp}")
+                    continue
+                if not acts and name_act != act_key and (name_act is not None or not own):
+                    continue
+                folders = os.path.relpath(d, rel_root).split(os.sep)
+                folders = [] if folders == ['.'] else folders
+                depth = len(folders)
+                is_copy = bool(self._COPY_HINT.search(f)) or any(
+                    self._looks_like_copy_dir(p, []) for p in folders)
+                list_name = bool(re.search(r'(foto|digitalbild|bild)liste', lname))
+                in_abgabe = bool(abg_key) and self._path_key(fp).startswith(abg_key)
+                score = (own_rows, self._path_key(fp) == default, not is_copy, in_abgabe,
+                         name_act == act_key, list_name, named_foto, info['fotocols'],
+                         -depth, -order)
+                order += 1
+                if best_score is None or score > best_score:
+                    best, best_score = fp, score
+        return best
 
     @staticmethod
     def _normalize_activity(s):
@@ -1035,32 +1321,6 @@ class PhotoRenamerApp:
         Leading zeros in numbers are intentionally preserved:
         'OV 2026/0014' and 'OV 2026/14' are NOT the same activity."""
         return re.sub(r'[\s_/\-]+', '', s).upper()
-
-    def _csv_is_compatible(self, csv_path):
-        """Check that the CSV has at least StellenNr and PosNr columns."""
-        try:
-            with open(csv_path, 'r', encoding='cp1252', errors='replace') as f:
-                headers = set(csv.DictReader(f, delimiter=';').fieldnames or [])
-            return {'StellenNr', 'PosNr'}.issubset(headers)
-        except Exception:
-            return False
-
-    def _csv_activity_matches(self, csv_path, act_wnk):
-        """Read the first data row and compare the Aktivitaet field to act_wnk.
-        Returns True  = match
-                False = mismatch (warn the caller — could be a different activity)
-                None  = no data rows yet (empty CSV; accept it)
-        """
-        try:
-            with open(csv_path, 'r', encoding='cp1252', errors='replace') as f:
-                for row in csv.DictReader(f, delimiter=';'):
-                    val = row.get('Aktivitaet', '').strip()
-                    if val:
-                        return (self._normalize_activity(val)
-                                == self._normalize_activity(act_wnk))
-            return None  # header-only CSV
-        except Exception:
-            return None
 
     def _core_process_photos(self, mode, raw_act, base_dir, filter_raw,
                              ignore_old_exif, main_photo, photo_mapping,
@@ -1073,29 +1333,37 @@ class PhotoRenamerApp:
 
         allowed = ([f"{int(x.strip()):04d}" for x in filter_raw.split(",")
                     if x.strip().isdigit()] if filter_raw.strip() else None)
-        t_dir = (self.get_output_folder_path(base_dir, act_norm)
-                 if mode == "rename_and_move" else base_dir)
+        out_dir = self.get_output_folder_path(base_dir, act_norm,
+                                              exclude=kwargs.get('skipped_dirs'))
+        out_key = self._path_key(out_dir)
+        t_dir = out_dir if mode == "rename_and_move" else base_dir
         if mode == "rename_and_move" and not os.path.exists(t_dir):
             os.makedirs(t_dir)
 
-        # Collect photos from primary dir + all extra (merged) dirs
+        # Fotos aus Haupt- und zusammengeführten Ordnern. Aus dem Abgabe-
+        # Fotoordner zählt nur seine oberste Ebene; Unterordner darin (z.B.
+        # 'aussortiert') werden nie angefasst.
         fotos_folder = f"{act_norm}_Fotos"
-        all_f = list(self.gather_all_photos(base_dir, skip_dir_names=[fotos_folder]))
-        for xd in (extra_dirs or []):
-            if os.path.isdir(xd):
-                all_f += self.gather_all_photos(xd, skip_dir_names=[fotos_folder])
-        all_f = list(set(all_f))
+        found = {}
+        for d in [base_dir] + [x for x in (extra_dirs or []) if os.path.isdir(x)]:
+            for f in self.gather_all_photos(d, skip_dir_names=[fotos_folder],
+                                            flat_dirs=[out_dir]):
+                found.setdefault(self._path_key(f), f)
+        if mode == "rename_and_move" and os.path.isdir(out_dir):
+            for f in self.gather_all_photos(out_dir, flat_dirs=[out_dir]):
+                found.setdefault(self._path_key(f), f)
+        all_f = sorted(found.values())
         r_c, m_c = 0, 0
-        # When the source folder IS already the _Fotos folder (standalone case),
-        # base_dir == t_dir → don't apply the "already in target" skip
-        base_is_target = os.path.abspath(base_dir) == os.path.abspath(t_dir)
 
         for fp in all_f:
-            if (mode == "rename_and_move" and not base_is_target and
-                    os.path.abspath(os.path.dirname(fp)) == os.path.abspath(t_dir)):
-                continue
             fn = os.path.basename(fp)
             parsed = self.parse_photo_name(fn)
+            # Fertig benannte Fotos im Abgabe-Fotoordner bleiben, wo sie sind;
+            # ein dort abgelegtes Rohfoto ('7-3.jpg') wird an Ort und Stelle
+            # umbenannt.
+            if (mode == "rename_and_move" and not parsed
+                    and self._path_key(os.path.dirname(fp)) == out_key):
+                continue
 
             if parsed:
                 st, pos = parsed
@@ -1105,13 +1373,15 @@ class PhotoRenamerApp:
                 if ed and ed.year < y and not ignore_old_exif:
                     self.log(f"   [X] Ignoriert: {fn} (Jahr vor Grabung).")
                     continue
+                # 'Nur umbenennen' benennt vor Ort um (im Ordner des Fotos)
+                dest = os.path.dirname(fp) if mode == "rename_only" else t_dir
                 final_fn = self.get_unique_filename(
-                    t_dir, f"{act_norm}_{st}_{pos}",
+                    dest, f"{act_norm}_{st}_{pos}",
                     os.path.splitext(fn)[1].lower(), source_filepath=fp)
                 if final_fn is None:
                     self.log(f"   [-] Übersprungen: '{fn}' identisch vorhanden.")
                     continue
-                f_path = os.path.join(t_dir, final_fn)
+                f_path = os.path.join(dest, final_fn)
                 # Guard: don't move/rename a file to itself
                 if os.path.abspath(fp) == os.path.abspath(f_path):
                     self.log(f"   [-] Bereits korrekt benannt: {fn}")
@@ -1156,18 +1426,20 @@ class PhotoRenamerApp:
         if not p or not os.path.isdir(base_dir):
             return None
         act_norm = f"{p}_{y}_{pr}"
-        t_dir = self.get_output_folder_path(base_dir, act_norm)
+        t_dir = self.get_output_folder_path(base_dir, act_norm,
+                                            exclude=kwargs.get('skipped_dirs'))
         if not os.path.exists(t_dir):
             os.makedirs(t_dir)
         allowed = ([f"{int(x.strip()):04d}" for x in filter_raw.split(",")
                     if x.strip().isdigit()] if filter_raw.strip() else None)
         fotos_folder = f"{act_norm}_Fotos"
-        all_photos = list(self.gather_all_photos(base_dir, skip_dir_names=[fotos_folder]))
-        for xd in (extra_dirs or []):
-            if os.path.isdir(xd):
-                all_photos += self.gather_all_photos(xd, skip_dir_names=[fotos_folder])
+        found = {}
+        for d in [base_dir] + [x for x in (extra_dirs or []) if os.path.isdir(x)]:
+            for f in self.gather_all_photos(d, skip_dir_names=[fotos_folder],
+                                            flat_dirs=[t_dir]):
+                found.setdefault(self._path_key(f), f)
         m_c = 0
-        for fp in list(set(all_photos)):
+        for fp in sorted(found.values()):
             if os.path.abspath(os.path.dirname(fp)) == os.path.abspath(t_dir):
                 continue
             fn = os.path.basename(fp)
@@ -1193,10 +1465,17 @@ class PhotoRenamerApp:
         return m_c
 
     def _generate_fresh_rows(self, act_norm, act_wnk, y, allowed, ign_exif,
-                             p_map, main_p, search_dirs):
-        all_f = list(set([f for d in search_dirs
-                          if os.path.exists(d)
-                          for f in self.gather_all_photos(d)]))
+                             p_map, main_p, search_dirs, flat_dirs=None):
+        # Jede Datei nur einmal, auch wenn sie über zwei Suchordner erreichbar
+        # ist (z.B. _Fotos liegt im Quellordner) oder der Pfad einmal mit / und
+        # einmal mit \ geschrieben ist. Aus dem Abgabe-Fotoordner (flat_dirs)
+        # zählt nur die oberste Ebene, nicht z.B. 'aussortiert/'.
+        unique = {}
+        for d in search_dirs:
+            if d and os.path.exists(d):
+                for f in self.gather_all_photos(d, flat_dirs=flat_dirs):
+                    unique.setdefault(self._path_key(f), f)
+        all_f = sorted(unique.values())
         rows = []
         for fp in all_f:
             fn = os.path.basename(fp)
@@ -1229,188 +1508,1032 @@ class PhotoRenamerApp:
                     "FotoDatum": d_str,
                     "Kommentar": "",
                     "_sort_stelle": s_int,
-                    "_sort_pos": p_int
+                    "_sort_pos": p_int,
+                    "_src": fp,
+                    "_date": ed if d_str else None,
                 })
         return rows
 
-    def _core_create_wnk_csv(self, silent=False, raw_act="", base_dir="", filter_raw="",
-                             ignore_old_exif=False, main_photo="", photo_mapping=None,
-                             extra_dirs=None, **kwargs):
-        if photo_mapping is None:
-            photo_mapping = {}
-        p, y, pr = self.parse_activity(raw_act)
-        if not p or not os.path.isdir(base_dir):
+    # =========================================================================
+    # FOTOLISTE: LESEN, ZUSAMMENFÜHREN, SPEICHERN
+    # =========================================================================
+    # Grundregel: Jede Kombination aus Aktivität, Stelle und Position steht
+    # höchstens EINMAL in einer Fotoliste. Vorhandene Einträge (samt
+    # Kommentaren) bleiben erhalten; aus den Fotos kommt nur hinzu, was noch
+    # fehlt. Geschrieben wird erst nach Bestätigung im Speichern-Dialog.
+
+    @staticmethod
+    def _path_key(path):
+        """Vergleichsform eines Pfads: dieselbe Datei ergibt denselben Schlüssel,
+        egal ob mit / oder \\ und in welcher Groß-/Kleinschreibung."""
+        return os.path.normcase(os.path.abspath(path))
+
+    @staticmethod
+    def _to_int(value):
+        """'5', ' 0005 ', '5.0' und '5,00' (Excel) -> 5; '1.000' (deutscher
+        Tausenderpunkt) -> 1000; leere oder andere Werte -> None."""
+        s = str(value or '').strip()
+        if re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{3})+', s):
+            return int(s.replace('.', ''))
+        m = re.fullmatch(r'([0-9]+)(?:[.,]0{1,2})?', s)
+        return int(m.group(1)) if m else None
+
+    def _activity_key(self, text, strict=False):
+        """Vergleichsform einer Aktivität: 'OV 2022/1068', 'OV_22_1068' und
+        'OV_2022_1068' ergeben dasselbe ('OV', 2022, 1068). strict: anderer
+        Text (z.B. '--- Tag 2 ---' oder 'dto.' in der Spalte Aktivitaet) gilt
+        nicht als Aktivität (None)."""
+        s = str(text or '').strip()
+        if not s:
             return None
-        act_norm, act_wnk = f"{p}_{y}_{pr}", f"{p} {y}/{int(pr)}"
+        m = re.fullmatch(
+            r"([A-Za-z]{2})[\s_/-]*([0-9]{4}|[0-9]{2})[\s_/-]*([0-9]{1,5})", s)
+        if not m:
+            return None if strict else self._normalize_activity(s)
+        year = int(m.group(2)) + (2000 if len(m.group(2)) == 2 else 0)
+        return (m.group(1).upper(), year, int(m.group(3)))
 
-        # Auto-detect existing CSV (also in extra merged dirs); fall back to default path
-        csv_p = (self._find_existing_csv(base_dir, act_norm, extra_dirs=extra_dirs or [])
-                 or self._get_default_csv_path(base_dir, act_norm))
-        t_dir = self.get_output_folder_path(base_dir, act_norm)
+    def _activity_in_text(self, text):
+        """Aktivität irgendwo in einem Datei- oder Ordnernamen, sonst None."""
+        m = re.search(r"(?:^|[^A-Za-z])([A-Za-z]{2})[\s_/-]?([0-9]{4}|[0-9]{2})"
+                      r"[\s_/-]?([0-9]{1,4})(?![0-9])", text)
+        return self._activity_key(f"{m.group(1)} {m.group(2)}/{m.group(3)}") if m else None
 
-        allowed = ([f"{int(x.strip()):04d}" for x in filter_raw.split(",")
-                    if x.strip().isdigit()] if filter_raw.strip() else None)
-        search_dirs = [base_dir, t_dir] + [d for d in (extra_dirs or [])
-                                            if os.path.isdir(d)]
-        rows = self._generate_fresh_rows(
-            act_norm, act_wnk, y, allowed, ignore_old_exif,
-            photo_mapping, main_photo, search_dirs)
-        if not rows:
-            if not silent:
-                messagebox.showwarning("Warnung", f"Keine Fotos für {act_norm} gefunden.")
-            return 0
-        # auto_save=True: always merge silently without dialog
-        return self._save_csv(rows, csv_p, silent=silent, auto_save=True)
+    @staticmethod
+    def _activity_label(key):
+        return f"{key[0]} {key[1]}/{key[2]}" if isinstance(key, tuple) else str(key)
 
-    def _core_update_csv_logic(self, existing_csv, raw_act="", base_dir="",
-                               filter_raw="", ignore_old_exif=False,
-                               main_photo="", photo_mapping=None,
-                               extra_dirs=None, **kwargs):
-        if photo_mapping is None:
-            photo_mapping = {}
-        p, y, pr = self.parse_activity(raw_act)
-        if not p or not os.path.isdir(base_dir):
-            return
-        act_norm, act_wnk = f"{p}_{y}_{pr}", f"{p} {y}/{int(pr)}"
-        t_dir = self.get_output_folder_path(base_dir, act_norm)
-        allowed = ([f"{int(x.strip()):04d}" for x in filter_raw.split(",")
-                    if x.strip().isdigit()] if filter_raw.strip() else None)
-        search_dirs = [base_dir, t_dir] + [d for d in (extra_dirs or [])
-                                            if os.path.isdir(d)]
-        rows = self._generate_fresh_rows(
-            act_norm, act_wnk, y, allowed, ignore_old_exif,
-            photo_mapping, main_photo, search_dirs)
-        if rows:
-            # action 5: use dialog (auto_save=False)
-            self._save_csv(rows, existing_csv, merge_source=existing_csv,
-                           silent=False, auto_save=False)
+    @staticmethod
+    def _field_label(field):
+        """Spaltenname, wie er in der Datei steht (siehe _read_csv_table)."""
+        return field.split('\x00', 1)[0]
 
-    def _save_csv(self, fresh_rows, def_path, merge_source=None, silent=False, auto_save=False):
-        """
-        Save/merge CSV.
-        auto_save=True  → silently backup+overwrite if file exists (for actions 1-4)
-        auto_save=False → show dialog if file exists (for action 5)
-        """
-        f_merge = merge_source if merge_source else (
-            def_path if os.path.exists(def_path) else None)
-        out_path, mode, b_path = def_path, "new", None
-        r_write = fresh_rows
-
-        if f_merge and os.path.exists(f_merge):
-            # Load existing rows, preserving all columns (esp. Kommentar)
-            old = []
+    def _read_csv_table(self, path):
+        """Liest eine Liste vollständig und verlustfrei ein.
+        - Kodierung: UTF-8 mit/ohne BOM oder cp1252; Trennzeichen ; Tab , oder
+          aus einer Excel-Zeile 'sep=;'.
+        - Kopfzeile = erste der ersten Zeilen mit StellenNr und PosNr; Zeilen
+          darüber (z.B. 'sep=;' oder ein Titel) werden als Vorspann unverändert
+          zurückgeschrieben.
+        - Doppelte oder leere Spaltennamen bekommen intern eindeutige Namen
+          ('Kommentar' + '\\x00' + Spaltennummer), damit keine Spalte eine
+          andere überschreibt; geschrieben wird wieder der Originalname.
+        - Mehr Felder als Spalten (z.B. ein ';' im Kommentar ohne Anführungs-
+          zeichen): der Überhang wird ans letzte Feld wieder angehängt.
+        Lesefehler werden weitergereicht – eine Liste darf nie halb gelesen
+        überschrieben werden. Gibt (Spalten, Zeilen, Vorspann) zurück; ganz
+        leere Zeilen entfallen."""
+        with open(path, 'rb') as f:
+            raw = f.read()
+        if raw.startswith(b'\xef\xbb\xbf'):
+            text = raw[3:].decode('utf-8', errors='replace')
+        else:
             try:
-                with open(f_merge, 'r', encoding='cp1252', errors='replace') as f:
-                    for r in csv.DictReader(f, delimiter=';'):
-                        r["_sort_stelle"] = int(r.get("StellenNr", 0))
-                        r["_sort_pos"] = int(r.get("PosNr", 0))
-                        old.append(r)
-            except:
-                pass
-            # Add only rows not yet in the existing CSV
-            keys = {(r["_sort_stelle"], r["_sort_pos"]) for r in old}
-            added = 0
-            for fr in fresh_rows:
-                if (fr["_sort_stelle"], fr["_sort_pos"]) not in keys:
-                    old.append(fr)
-                    added += 1
-            r_write = old
-
-            if auto_save:
-                if added == 0:
-                    # Nothing changed — skip write and backup entirely
-                    self.log(f"Fotoliste aktuell, nichts zu ergänzen: "
-                             f"{os.path.basename(f_merge)}")
-                    return len(r_write)
-                # New rows to add: backup and overwrite
-                out_path, mode, b_path = f_merge, "overwrite", f_merge + ".bak"
-                try:
-                    shutil.copy2(f_merge, b_path)
-                except Exception as e:
-                    self.log(f"Backup fehlgeschlagen: {e}")
-                    return None
-                self.log(f"Auto-Merge: {added} neue Einträge → {os.path.basename(f_merge)}")
-            else:
-                # Dialog mode (action 5)
-                is_batch = self.notebook.index(self.notebook.select()) == 1
-                if is_batch:
-                    choice = True
+                text = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                text = raw.decode('cp1252', errors='replace')
+        lines = text.splitlines(keepends=True)
+        delim, start = None, 0
+        first = lines[0].rstrip('\r\n') if lines else ''
+        if re.fullmatch(r'sep=.', first, re.IGNORECASE):
+            delim, start = first[4], 1
+        head_idx = start
+        for i in range(start, min(start + 5, len(lines))):
+            if 'StellenNr' in lines[i] and 'PosNr' in lines[i]:
+                head_idx = i
+                break
+        preamble = ''.join(lines[:head_idx])
+        header = lines[head_idx] if head_idx < len(lines) else ''
+        if delim is None:
+            delim = max((';', '\t', ','), key=header.count)
+            if not header.count(delim):
+                delim = ';'
+        reader = csv.reader(io.StringIO(''.join(lines[head_idx:]), newline=''),
+                            delimiter=delim)
+        head = next(reader, [])
+        fields, seen = [], set()
+        for i, name in enumerate(n.strip() for n in head):
+            fields.append(name if name and name not in seen else f"{name}\x00{i}")
+            seen.add(name)
+        rows, n_head = [], len(fields)
+        for vals in reader:
+            while len(vals) > n_head and not vals[-1].strip():
+                vals.pop()  # leere Felder hinter der letzten Spalte (';;' am Zeilenende)
+            if n_head and len(vals) > n_head:
+                if fields[n_head - 1] in ('Aktivitaet', 'StellenNr', 'PosNr',
+                                          'Fotograf', 'FotoDatum'):
+                    # Letzte Spalte ist ein Datenfeld: Überhang in eigene,
+                    # unbenannte Zusatzspalten statt das Feld zu verfälschen.
+                    while len(fields) < len(vals):
+                        fields.append(f"\x00{len(fields)}")
                 else:
-                    choice = messagebox.askyesnocancel(
-                        "Speichern",
-                        f"Liste existiert:\n'{os.path.basename(f_merge)}'\n\n"
-                        "[Ja]=Ersetzen (Kommentare bleiben!)\n[Nein]=Neu benennen")
+                    # ';' im Kommentar ohne Anführungszeichen: wieder anhängen
+                    vals = vals[:n_head - 1] + [delim.join(vals[n_head - 1:])]
+            row = {f: (vals[i] if i < len(vals) else '') for i, f in enumerate(fields)}
+            if any(v.strip() for v in row.values()):
+                rows.append(row)
+        return fields, rows, preamble
 
-                if choice is None:
-                    return None
-                elif choice is True:
-                    out_path, mode, b_path = f_merge, "overwrite", f_merge + ".bak"
-                    try:
-                        shutil.copy2(f_merge, b_path)
-                    except Exception:
-                        return None
-                else:
-                    out_path = filedialog.asksaveasfilename(
-                        initialfile=f"NEU_{os.path.basename(f_merge)}",
-                        defaultextension=".csv")
-                    if not out_path:
-                        return None
-                    mode = "new"
-
-        r_write.sort(key=lambda x: (x["_sort_stelle"], x["_sort_pos"]))
+    def _inspect_csv(self, path):
+        """Kurzprofil einer CSV (None, wenn sie sich nicht lesen lässt)."""
         try:
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            with open(out_path, 'w', newline='', encoding='cp1252', errors='replace') as f:
-                w = csv.DictWriter(
-                    f, fieldnames=["Aktivitaet", "StellenNr", "PosNr",
-                                   "Fotograf", "FotoDatum", "Kommentar"],
-                    delimiter=';', extrasaction='ignore')
-                w.writeheader()
-                w.writerows(r_write)
-            self.last_update_actions.append({'mode': mode, 'target': out_path, 'backup': b_path})
-            self.log(f"Gespeichert: {os.path.basename(out_path)}")
-            if not silent and self.notebook.index(self.notebook.select()) == 0:
-                messagebox.showinfo("Gespeichert",
-                                    f"Liste gespeichert:\n{os.path.basename(out_path)}")
-            return len(r_write)
-        except Exception as e:
-            self.log(f"Fehler beim Speichern: {e}")
+            fields, rows, preamble = self._read_csv_table(path)
+        except Exception:
             return None
+        fs = set(fields)
+        acts = {self._activity_key(r.get('Aktivitaet', ''), strict=True) for r in rows}
+        acts.discard(None)
+        return {'fields': fields, 'rows': rows, 'preamble': preamble,
+                'compatible': {'StellenNr', 'PosNr'} <= fs,
+                'fotocols': bool({'Fotograf', 'FotoDatum'} & fs),
+                'activities': acts}
+
+    def _dedupe_fresh_rows(self, rows, act_norm):
+        """Eine Zeile je Stelle/Position. Mehrere Fotos derselben Stelle/Position
+        – z.B. ..._0005_010.jpg und ..._0005_010_A.jpg oder ein liegengebliebenes
+        Rohfoto '5-10.jpg' neben der umbenannten Kopie – ergeben nur EINEN
+        Eintrag. Vorrang hat das regulär benannte Foto, sonst das älteste.
+        Gibt (eindeutige Zeilen, {(stelle, pos): [Dateien]}) zurück."""
+        prefix = act_norm.lower() + '_'
+
+        def rank(r, canon):
+            stem = os.path.splitext(os.path.basename(r['_src']))[0].lower()
+            return (0 if stem == canon else 1 if stem.startswith(prefix) else 2,
+                    r['_date'] or datetime.max, r['_src'].lower())
+
+        groups = {}
+        for r in rows:
+            groups.setdefault((r['_sort_stelle'], r['_sort_pos']), []).append(r)
+        unique, dups = [], {}
+        for (st, pos), grp in sorted(groups.items()):
+            if len(grp) > 1:
+                canon = f"{prefix}{st:04d}_{pos:03d}"
+                grp.sort(key=lambda r: rank(r, canon))
+                if not grp[0]['FotoDatum']:
+                    dated = sorted((r for r in grp if r['_date']), key=lambda r: r['_date'])
+                    if dated:
+                        grp[0]['FotoDatum'] = dated[0]['FotoDatum']
+                dups[(st, pos)] = [r['_src'] for r in grp]
+            unique.append(grp[0])
+        return unique, dups
+
+    def _build_csv_plan(self, d, list_path=None):
+        """Bereitet die Fotoliste einer Maßnahme vor, OHNE zu schreiben.
+        list_path: vom Nutzer gewählte vorhandene Liste (Einzel, Aktion 5);
+        sonst wird die vorhandene Liste gesucht. None bei ungültiger
+        Aktivität oder fehlendem Ordner."""
+        p, y, pr = self.parse_activity(d.get('raw_act', ''))
+        base_dir = d.get('base_dir', '')
+        if not p or not base_dir or not os.path.isdir(base_dir):
+            return None
+        act_norm, act_wnk = f"{p}_{y}_{pr}", f"{p} {y}/{int(pr)}"
+        extra = [x for x in (d.get('extra_dirs') or []) if os.path.isdir(x)]
+        skipped = d.get('skipped_dirs') or []
+        t_dir = self.get_output_folder_path(base_dir, act_norm, exclude=skipped)
+        filter_raw = d.get('filter_raw', '') or ''
+        allowed = ([f"{int(x.strip()):04d}" for x in filter_raw.split(",")
+                    if x.strip().isdigit()] if filter_raw.strip() else None)
+        rows = self._generate_fresh_rows(
+            act_norm, act_wnk, y, allowed, d.get('ignore_old_exif', False),
+            d.get('photo_mapping') or {}, d.get('main_photo', ''),
+            [base_dir, t_dir] + extra, flat_dirs=[t_dir])
+        fresh, photo_dups = self._dedupe_fresh_rows(rows, act_norm)
+        if photo_dups:
+            self.log(f"{act_wnk}: {len(photo_dups)}× mehrere Fotos derselben "
+                     f"Stelle/Position – je nur EIN Eintrag in der Fotoliste:")
+            for (st, pos), files in list(photo_dups.items())[:30]:
+                self.log(f"   [=] {st}-{pos}: "
+                         + ", ".join(os.path.basename(f) for f in files))
+            if len(photo_dups) > 30:
+                self.log(f"   … und {len(photo_dups) - 30} weitere")
+        act_key = self._activity_key(act_wnk)
+        pin_key = (act_key, self._path_key(base_dir))
+        if list_path is None:
+            # In dieser Sitzung für DIESEN Quellordner über »Speicherort
+            # ändern…« woanders gespeichert (z.B. auf einen Stick)? Dann diese
+            # Liste weiterführen, statt am Standardort eine zweite anzulegen.
+            chosen = self._chosen_targets.get(pin_key)
+            info = self._inspect_csv(chosen) if chosen and os.path.isfile(chosen) else None
+            if info and info['compatible'] and (not info['activities']
+                                                or act_key in info['activities']):
+                list_path = chosen
+        if list_path is None:
+            list_path = self._find_existing_csv(base_dir, act_norm, extra_dirs=extra,
+                                                skip_dirs=skipped)
+        return {
+            'label': act_wnk,
+            'act_key': act_key,
+            'pin_key': pin_key,
+            'user_target': False,  # True, sobald »Speicherort ändern…« benutzt wurde
+            'source': list_path,
+            'target': list_path or self._get_default_csv_path(base_dir, act_norm,
+                                                              exclude=skipped),
+            'fresh': fresh,
+            'photo_dups': photo_dups,
+            'selected': True,
+        }
+
+    def _compose_csv(self, plan, merge_dups=True):
+        """Berechnet, was nach plan['target'] geschrieben würde – schreibt aber
+        nichts. Grundlage sind die Zieldatei (falls vorhanden) und die bisherige
+        Liste plan['source']; aus den Fotos kommt nur hinzu, was dort nach
+        Aktivität + Stelle + Position noch fehlt. Mit merge_dups werden schon
+        vorhandene Doppel-Einträge verlustfrei zusammengeführt (leere Felder
+        werden aufgefüllt); widersprechen sich ihre Angaben, bleiben sie stehen
+        und werden gemeldet."""
+        target, source, own = plan['target'], plan['source'], plan['act_key']
+        res = {'error': None, 'foreign': False, 'other_acts': set(), 'looks_foto': True,
+               'target_exists': os.path.isfile(target),
+               'target_is_source': bool(source) and
+               self._path_key(source) == self._path_key(target),
+               'looks_copy': self._path_looks_like_copy(target),
+               'n_base': 0, 'n_carried': 0, 'n_new': 0, 'n_known': 0, 'n_filled': 0,
+               'n_foreign_left': 0, 'n_act_fixed': 0,
+               'dup_lossless': [], 'dup_conflicts': [], 'src_conflicts': [],
+               'bad_chars': set(), 'merge_dups': merge_dups, 'preamble': '',
+               'changed': False, 'fields': list(FOTOLISTE_FIELDS), 'rows': []}
+
+        tables = []  # (Profil, ist_Zieldatei) – Zieldatei zuerst, sie hat Vorrang
+        if res['target_exists']:
+            info = self._inspect_csv(target)
+            if info is None:
+                res['error'] = f"Zieldatei lässt sich nicht lesen: {target}"
+                return res
+            if info['compatible']:
+                tables.append((info, True))
+                lname = os.path.basename(target).lower()
+                res['looks_foto'] = info['fotocols'] or 'foto' in lname or 'bild' in lname
+                res['other_acts'] = {a for a in info['activities'] if a != own}
+            else:
+                res['foreign'] = True  # keine Fotoliste – würde nach Rückfrage ersetzt
+        if source and not res['target_is_source']:
+            info = self._inspect_csv(source) if os.path.isfile(source) else None
+            if info is None or not info['compatible']:
+                res['error'] = f"Bisherige Fotoliste lässt sich nicht lesen: {source}"
+                return res
+            tables.append((info, False))
+
+        fields = list(tables[0][0]['fields']) if tables else []
+        for info, _ in tables[1:]:
+            fields += [f for f in info['fields'] if f not in fields]
+        fields += [f for f in FOTOLISTE_FIELDS if f not in fields]
+        res['preamble'] = tables[0][0]['preamble'] if tables else ''
+        key_fields = ('Aktivitaet', 'StellenNr', 'PosNr')
+
+        def key_of(r, act):
+            s, p = self._to_int(r.get('StellenNr')), self._to_int(r.get('PosNr'))
+            if s is None or p is None:
+                return None  # nicht auswertbar: Zeile bleibt unverändert stehen
+            return (act, s, p)
+
+        out, out_keys, out_ti, where, loose = [], [], [], {}, {}
+        for ti, (info, is_target) in enumerate(tables):
+            # Leere Aktivität erbt die der Zeile darüber (Sammellisten, in denen
+            # die Aktivität nur in der ersten Zeile eines Blocks steht); vor der
+            # ersten Angabe gilt die eigene Aktivität. Nur echte Aktivitäts-
+            # angaben zählen – '--- Tag 2 ---' oder 'dto.' in der Spalte nicht.
+            last_act = own
+            for r in info['rows']:
+                act = self._activity_key(r.get('Aktivitaet', ''), strict=True)
+                last_act = act or last_act
+                k = key_of(r, last_act)
+                if not is_target and last_act != own:
+                    # Aus einer Sammelliste nur die eigene Maßnahme in eine
+                    # ANDERE Datei übernehmen; der Rest bleibt, wo er ist.
+                    if k is not None:
+                        res['n_foreign_left'] += 1
+                    continue
+                if k is None:
+                    sig = tuple((r.get(f) or '').strip() for f in fields)
+                    if ti > 0 and loose.get(sig, 0) > 0:
+                        loose[sig] -= 1  # gleiche Zeile steht schon in der Zieldatei
+                        continue
+                    if ti == 0:
+                        loose[sig] = loose.get(sig, 0) + 1
+                else:
+                    if ti > 0 and any(t < ti for _, t in where.get(k, [])):
+                        # Steht schon in der Zieldatei: deren Angaben haben
+                        # Vorrang; leere Felder dort aus der bisherigen Liste
+                        # auffüllen, Widersprüche melden.
+                        tgt, diff = out[where[k][0][0]], []
+                        for f in fields:
+                            sv = (r.get(f) or '').strip()
+                            if not sv or f in key_fields:
+                                continue
+                            tv = (tgt.get(f) or '').strip()
+                            if not tv:
+                                tgt[f] = r[f]
+                                res['n_filled'] += 1
+                            elif tv != sv:
+                                diff.append(f)
+                        if diff:
+                            res['src_conflicts'].append((k, diff))
+                        continue
+                    where.setdefault(k, []).append((len(out), ti))
+                out.append(dict(r))
+                out_keys.append(k)
+                out_ti.append(ti)
+                res['n_base' if is_target else 'n_carried'] += 1
+
+        # Schon vorhandene Doppel-Einträge (z.B. aus früheren Läufen)
+        drop = set()
+        for k, places in where.items():
+            if len(places) < 2:
+                continue
+            group = [out[i] for i, _ in places]
+            conflict = [f for f in fields if f not in key_fields
+                        and len({(r.get(f) or '').strip() for r in group} - {''}) > 1]
+            if conflict:
+                res['dup_conflicts'].append((k, len(group), conflict))
+                continue
+            res['dup_lossless'].append((k, len(group)))
+            if merge_dups:
+                keep = group[0]
+                for r in group[1:]:
+                    for f in fields:
+                        if not (keep.get(f) or '').strip() and (r.get(f) or '').strip():
+                            keep[f] = r[f]
+                drop.update(i for i, _ in places[1:])
+        if drop:
+            out = [r for i, r in enumerate(out) if i not in drop]
+            out_keys = [k for i, k in enumerate(out_keys) if i not in drop]
+            out_ti = [t for i, t in enumerate(out_ti) if i not in drop]
+
+        # Reihenfolge der vorhandenen Zeilen: nach Aktivität (in der Reihenfolge
+        # ihres ersten Auftretens), Stelle und Position. Zeilen ohne Nummer
+        # (Überschriften, Trennzeilen wie '--- Tag 2 ---') bleiben direkt VOR
+        # der Zeile, vor der sie standen, am Ende stehende bleiben am Ende.
+        ranks, keyed = {}, []
+        for k in out_keys:
+            keyed.append(None if k is None else
+                         (ranks.setdefault(k[0], len(ranks)), k[1], k[2]))
+        order_keys, nxt = [None] * len(out), (float('inf'), 0, 0)
+        for i in range(len(out) - 1, -1, -1):
+            if keyed[i] is not None:
+                nxt = keyed[i]
+            order_keys[i] = nxt + (i,)
+        own_rank = ranks.setdefault(own, len(ranks))
+        # Eine nicht nach Stelle/Position geordnete Liste (z.B. chronologisch)
+        # wird NICHT umsortiert: neue Einträge kommen hinter die letzte Zeile
+        # mit Nummer (vor abschließende Notizzeilen). Maßgeblich ist die
+        # Ordnung der Grundliste selbst, nicht angehängte Zeilen einer zweiten.
+        present = [k for k, t in zip(keyed, out_ti) if k is not None and t == 0]
+        keep_order = any(a > b for a, b in zip(present, present[1:]))
+        if keep_order:
+            last = max((i for i, k in enumerate(keyed) if k is not None), default=-1)
+            order_keys = [(0, i) if i <= last else (2, i) for i in range(len(out))]
+
+        # Neue Einträge aus den Fotos – nur, was noch fehlt
+        keys = set(where)
+        for fr in plan['fresh']:
+            k = (own, fr['_sort_stelle'], fr['_sort_pos'])
+            if k in keys:
+                res['n_known'] += 1
+                continue
+            keys.add(k)
+            row = {f: '' for f in fields}
+            row.update({f: fr[f] for f in FOTOLISTE_FIELDS})
+            order_keys.append((1, k[1], k[2]) if keep_order
+                              else (own_rank, k[1], k[2], len(order_keys)))
+            out.append(row)
+            out_keys.append(k)
+            res['n_new'] += 1
+        ordered = sorted(zip(order_keys, out, out_keys), key=lambda t: t[0])
+        out = [r for _, r, _ in ordered]
+
+        # Jede Zeile muss beim nächsten Lesen dieselbe Aktivität ergeben wie
+        # jetzt. Ist eine Blockkopf-Zeile weggefallen (zusammengeführt) oder
+        # steht eine Zeile jetzt unter einer anderen Maßnahme, wird ihre
+        # Aktivität ausdrücklich eingetragen.
+        cur = own
+        for r, (_, _, k) in zip(out, ordered):
+            a = self._activity_key(r.get('Aktivitaet', ''), strict=True)
+            if a is not None:
+                cur = a
+            elif k is not None and k[0] != cur:
+                r['Aktivitaet'] = self._activity_label(k[0])
+                cur = k[0]
+                res['n_act_fixed'] += 1
+
+        # Zeichen, die die Windows-Kodierung der Liste (cp1252) nicht kennt –
+        # in Zeilen, Spaltennamen und Vorspann (Titelzeile)
+        texts = [v for r in out for v in r.values()] + [res['preamble']] + [
+            self._field_label(f) for f in fields]
+        for v in texts:
+            try:
+                (v or '').encode('cp1252')
+            except UnicodeEncodeError:
+                res['bad_chars'].update(ch for ch in v if not self._cp1252_ok(ch))
+
+        base_fields = tables[0][0]['fields'] if tables and tables[0][1] else None
+        res['changed'] = bool(not res['target_exists'] or res['foreign']
+                              or res['n_new'] or res['n_carried'] or res['n_filled']
+                              or res['n_act_fixed'] or drop or fields != base_fields)
+        res['fields'], res['rows'] = fields, out
+        return res
+
+    @staticmethod
+    def _cp1252_ok(ch):
+        try:
+            ch.encode('cp1252')
+            return True
+        except UnicodeEncodeError:
+            return False
+
+    @staticmethod
+    def _n(n, one, many):
+        return f"{n} {one if n == 1 else many}"
+
+    def _describe_comp(self, plan, comp):
+        """Texte für den Speichern-Dialog: (Hinweise, Warnungen, ist_Fehler)."""
+        if comp['error']:
+            return "", "✖ " + comp['error'], True
+        info, warn = [], []
+        src = plan['source']
+        if comp['foreign']:
+            warn.append("⚠ Die gewählte Datei ist keine Fotoliste (Spalten StellenNr/PosNr "
+                        "fehlen) – sie würde ERSETZT (Sicherung .bak).")
+        elif comp['target_exists']:
+            info.append(f"Ziel: vorhandene Liste mit {self._n(comp['n_base'], 'Eintrag', 'Einträgen')}"
+                        " – wird ergänzt (Sicherung .bak).")
+        elif src:
+            info.append("Ziel: neue Datei.")
+        else:
+            info.append("Ziel: neue Datei (keine vorhandene Fotoliste gefunden"
+                        + (" – zum Anlegen anhaken)." if not plan['selected'] else ")."))
+        if src and not comp['target_is_source']:
+            info.append(f"Bisherige Liste: {src}\n   → "
+                        f"{self._n(comp['n_carried'], 'Eintrag wird', 'Einträge werden')} "
+                        "daraus übernommen"
+                        + (f", {self._n(comp['n_filled'], 'leeres Feld', 'leere Felder')} "
+                           "der Zieldatei daraus ergänzt" if comp['n_filled'] else "")
+                        + "; sie selbst bleibt unverändert.")
+        if comp['n_foreign_left']:
+            info.append(f"{self._n(comp['n_foreign_left'], 'Eintrag', 'Einträge')} anderer "
+                        "Maßnahmen aus der bisherigen Liste bleiben dort und werden nicht "
+                        "übernommen.")
+        if comp['src_conflicts']:
+            keys = ", ".join(f"{k[1]}-{k[2]}" for k, _ in comp['src_conflicts'][:8])
+            more = " …" if len(comp['src_conflicts']) > 8 else ""
+            warn.append(f"⚠ Bei {self._n(len(comp['src_conflicts']), 'Eintrag', 'Einträgen')} "
+                        "weicht die bisherige Liste von der Zieldatei ab; es gelten die "
+                        f"Angaben der Zieldatei (Stelle-Position): {keys}{more}")
+        if comp['looks_copy']:
+            warn.append("⚠ Die Zieldatei sieht nach einer Kopie/Sicherung aus – "
+                        "ist das wirklich die gültige Fotoliste?")
+        if comp['bad_chars']:
+            warn.append("⚠ Diese Zeichen kennt die Fotoliste (Windows-Kodierung) nicht, "
+                        "sie werden zu '?': " + " ".join(sorted(comp['bad_chars']))[:60])
+        info.append(f"Aus den Fotos neu: {self._n(comp['n_new'], 'Eintrag', 'Einträge')}"
+                    + (f" ({self._n(comp['n_known'], 'Stelle/Position steht', 'Stellen/Positionen stehen')}"
+                       " schon in der Liste)" if comp['n_known'] else "") + ".")
+        if plan['photo_dups']:
+            info.append(f"{self._n(len(plan['photo_dups']), 'Stelle/Position', 'Stellen/Positionen')}"
+                        " mit mehreren Fotos (z.B. _A-Varianten) – je nur ein Eintrag "
+                        "(Dateien siehe Protokoll).")
+        if comp['dup_lossless']:
+            n = self._n(len(comp['dup_lossless']), 'doppelter Eintrag', 'doppelte Einträge')
+            if comp['merge_dups']:
+                info.append(f"{n} der vorhandenen Liste: wird verlustfrei zusammengeführt.")
+            else:
+                warn.append(f"⚠ {n} der vorhandenen Liste: bleibt stehen.")
+        if comp['dup_conflicts']:
+            keys = ", ".join(f"{k[1]}-{k[2]}" for k, _, _ in comp['dup_conflicts'][:8])
+            more = " …" if len(comp['dup_conflicts']) > 8 else ""
+            warn.append(f"⚠ {self._n(len(comp['dup_conflicts']), 'doppelter Eintrag', 'doppelte Einträge')}"
+                        f" mit abweichenden Angaben bleibt stehen – bitte von Hand prüfen "
+                        f"(Stelle-Position): {keys}{more}")
+        if comp['other_acts']:
+            warn.append("⚠ Die Zieldatei enthält Einträge anderer Aktivität(en): "
+                        + ", ".join(sorted(self._activity_label(a)
+                                           for a in comp['other_acts'])))
+        if comp['target_exists'] and not comp['foreign'] and not comp['looks_foto']:
+            warn.append("⚠ Die Zieldatei sieht nicht wie eine Fotoliste aus "
+                        "(keine Spalte Fotograf/FotoDatum).")
+        if not comp['changed']:
+            info.append("Die Liste ist aktuell – es gibt nichts zu speichern.")
+        return "\n".join(info), "\n".join(warn), False
+
+    def _ask_csv_save(self, plans, batch):
+        """Speichern-Dialog für eine (Einzel) oder mehrere (Batch) Fotolisten.
+        Zeigt je Liste Ziel, neue Einträge und Dopplungen; der Speicherort ist
+        über »Speicherort ändern…« frei wählbar. Passt plans[i]['target'] und
+        ['selected'] an und gibt merge_dups zurück – oder None bei Abbruch."""
+        # Ein Dialog zu einem minimierten Hauptfenster bliebe unsichtbar (z.B.
+        # wenn man während eines langen Batch-Laufs minimiert hat) – das
+        # Programm wartet aber auf eine Antwort, also Hauptfenster hervorholen.
+        if self.root.state() == 'iconic':
+            self.root.deiconify()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Fotolisten speichern" if batch else "Fotoliste speichern")
+        dlg.configure(bg=self.bg_color)
+        dlg.transient(self.root)
+        width = min(880, self.root.winfo_screenwidth() - 40)
+        height = min(700, 250 + 180 * len(plans)) if batch else 400
+        height = min(height, self.root.winfo_screenheight() - 120)  # Knöpfe sichtbar
+        x = max(0, min(self.root.winfo_rootx() + 30, self.root.winfo_screenwidth() - width - 20))
+        y = max(0, min(self.root.winfo_rooty() + 30,
+                       self.root.winfo_screenheight() - height - 80))
+        dlg.geometry(f"{width}x{height}+{x}+{y}")
+        dlg.minsize(560, 300)
+        merge_var = tk.BooleanVar(master=dlg, value=True)
+        result = {'merge': None}
+        lab = dict(bg=self.bg_color, fg=self.fg_color)
+        chk = dict(bg=self.bg_color, fg=self.fg_color, selectcolor=self.entry_bg,
+                   activebackground=self.bg_color, activeforeground=self.fg_color)
+        colors = {0: self.fg_color,
+                  1: "#ffaa33" if self.is_dark_mode else "#a04f00",
+                  2: "#ff5555" if self.is_dark_mode else "#b00000"}
+
+        intro = ("Folgende Fotolisten würden geschrieben – gespeichert werden nur die "
+                 "angehakten." if batch else
+                 "Bitte Speicherort prüfen – über »Speicherort ändern…« frei wählbar.")
+        intro += ("\nJede Kombination aus Stelle und Position steht höchstens einmal in "
+                  "der Liste. Vorhandene Einträge und Kommentare bleiben erhalten.")
+        tk.Label(dlg, text=intro, justify="left", anchor="w", wraplength=width - 40,
+                 **lab).pack(fill="x", padx=10, pady=(10, 4))
+
+        bottom = tk.Frame(dlg, bg=self.bg_color)
+        bottom.pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+
+        area = tk.Frame(dlg, bg=self.bg_color)
+        area.pack(fill="both", expand=True, padx=10)
+        canvas = tk.Canvas(area, bg=self.bg_color, highlightthickness=0)
+        sbar = tk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=self.bg_color)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        canvas.configure(yscrollcommand=sbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sbar.pack(side="right", fill="y")
+
+        widgets = []
+
+        def refresh_all():
+            merge = merge_var.get()
+            uses = {}
+            for i, plan in enumerate(plans):
+                plan['selected'] = widgets[i]['sel'].get() if batch else True
+                if plan['selected']:
+                    k = self._path_key(plan['target'])
+                    uses[k] = uses.get(k, 0) + 1
+            for i, plan in enumerate(plans):
+                comp = self._compose_csv(plan, merge)
+                plan['_comp'] = comp
+                info, warn, is_error = self._describe_comp(plan, comp)
+                if plan['selected'] and uses.get(self._path_key(plan['target']), 0) > 1:
+                    warn = (warn + "\n" if warn else "") + (
+                        "⚠ Eine andere angehakte Maßnahme schreibt in DIESELBE Datei – "
+                        "bitte Speicherort ändern oder abwählen.")
+                w = widgets[i]
+                w['path'].set(plan['target'])
+                w['entry'].xview_moveto(1.0)  # Dateiname sichtbar, nicht nur der Pfadanfang
+                w['status'].config(text=info)
+                w['warn'].config(text=warn, fg=colors[2 if is_error else 1])
+                if warn:
+                    w['warn'].grid()
+                else:
+                    w['warn'].grid_remove()
+
+        def change(i):
+            plan = plans[i]
+            start = os.path.dirname(plan['target'])
+            while start and not os.path.isdir(start) and os.path.dirname(start) != start:
+                start = os.path.dirname(start)  # Vorschlagsordner existiert evtl. noch nicht
+            fp = filedialog.asksaveasfilename(
+                parent=dlg, title=f"Fotoliste {plan['label']} speichern unter",
+                initialdir=start if start and os.path.isdir(start) else None,
+                initialfile=os.path.basename(plan['target']),
+                defaultextension=".csv", filetypes=[("CSV Dateien", "*.csv")],
+                confirmoverwrite=False)  # vorhandene Liste wird ergänzt, nicht ersetzt
+            if fp:
+                plan['target'] = os.path.normpath(fp)
+                plan['user_target'] = True
+                if batch:
+                    widgets[i]['sel'].set(True)  # neuer Ort gewählt = speichern gewollt
+                refresh_all()
+
+        def set_all(value):
+            for w in widgets:
+                w['sel'].set(value)
+            refresh_all()
+
+        def on_save():
+            refresh_all()
+            chosen = [p for p in plans if p['selected']]
+            if not chosen:
+                messagebox.showinfo("Nichts ausgewählt",
+                                    "Es ist keine Fotoliste angehakt.", parent=dlg)
+                return
+            bad = [p for p in chosen if p['_comp']['error']]
+            if bad:
+                messagebox.showerror("Speichern nicht möglich", "\n".join(
+                    f"{p['label']}: {p['_comp']['error']}" for p in bad), parent=dlg)
+                return
+            seen = {}
+            for p in chosen:
+                k = self._path_key(p['target'])
+                if k in seen:
+                    messagebox.showerror(
+                        "Gleiche Zieldatei",
+                        f"{seen[k]['label']} und {p['label']} würden in dieselbe Datei "
+                        f"schreiben:\n{p['target']}\n\nBitte für eine davon einen anderen "
+                        "Speicherort wählen oder sie abwählen.", parent=dlg)
+                    return
+                seen[k] = p
+            for p in chosen:
+                c, name = p['_comp'], os.path.basename(p['target'])
+                if c['foreign'] and not messagebox.askyesno(
+                        "Datei ersetzen?",
+                        f"'{name}' ist keine Fotoliste (die Spalten StellenNr und PosNr "
+                        f"fehlen).\n\nTrotzdem durch die Fotoliste {p['label']} ERSETZEN?\n"
+                        f"(Eine Sicherung '{name}.bak' wird angelegt.)",
+                        icon="warning", parent=dlg):
+                    return
+                if c['other_acts'] and not messagebox.askyesno(
+                        "Andere Aktivität",
+                        f"'{name}' enthält Einträge anderer Aktivität(en): "
+                        + ", ".join(sorted(self._activity_label(a) for a in c['other_acts']))
+                        + f"\n\nTrotzdem die Einträge von {p['label']} dort ergänzen?",
+                        icon="warning", parent=dlg):
+                    return
+                if (c['target_exists'] and not c['foreign'] and not c['looks_foto']
+                        and not messagebox.askyesno(
+                            "Wirklich in diese Liste?",
+                            f"'{name}' sieht nicht wie eine Fotoliste aus (keine Spalte "
+                            f"Fotograf/FotoDatum).\n\nTrotzdem die Fotos von {p['label']} "
+                            "dort eintragen?", icon="warning", parent=dlg)):
+                    return
+            result['merge'] = merge_var.get()
+            dlg.destroy()
+
+        for i, plan in enumerate(plans):
+            fr = self._create_frame(inner, f" {plan['label']} ")
+            fr.pack(fill="x", pady=3, padx=2)
+            fr.columnconfigure(1, weight=1)
+            sel = tk.BooleanVar(master=dlg, value=plan['selected'])
+            if batch:
+                tk.Checkbutton(fr, text="speichern", variable=sel, command=refresh_all,
+                               **chk).grid(row=0, column=0, sticky="nw", padx=(0, 6))
+            status = tk.Label(fr, justify="left", anchor="w", wraplength=width - 190, **lab)
+            status.grid(row=0, column=1, columnspan=2, sticky="w")
+            warn = tk.Label(fr, justify="left", anchor="w", wraplength=width - 190,
+                            bg=self.bg_color, fg=colors[1])
+            warn.grid(row=1, column=1, columnspan=2, sticky="w")
+            path_var = tk.StringVar(master=dlg, value=plan['target'])
+            entry = tk.Entry(fr, textvariable=path_var, state="readonly",
+                             readonlybackground=self.entry_bg, fg=self.fg_color)
+            entry.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 1))
+            tk.Button(fr, text="Speicherort ändern…", bg=self.btn_bg_highlight,
+                      fg=self.fg_color, command=lambda i=i: change(i)
+                      ).grid(row=2, column=2, padx=(6, 0), pady=(3, 1))
+            widgets.append({'sel': sel, 'path': path_var, 'status': status, 'warn': warn,
+                            'entry': entry})
+
+        tk.Checkbutton(bottom, variable=merge_var, command=refresh_all,
+                       text="Schon vorhandene doppelte Einträge verlustfrei zusammenführen "
+                            "(nur wenn sich ihre Angaben nicht widersprechen)",
+                       **chk).pack(anchor="w")
+        btns = tk.Frame(bottom, bg=self.bg_color)
+        btns.pack(fill="x", pady=(6, 0))
+        if batch:
+            tk.Button(btns, text="Alle anhaken", bg=self.btn_bg_highlight, fg=self.fg_color,
+                      command=lambda: set_all(True)).pack(side="left")
+            tk.Button(btns, text="Alle abwählen", bg=self.btn_bg_highlight, fg=self.fg_color,
+                      command=lambda: set_all(False)).pack(side="left", padx=4)
+        tk.Button(btns, text="Abbrechen", bg=self.btn_bg_highlight, fg=self.fg_color,
+                  width=12, command=dlg.destroy).pack(side="right")
+        save_btn = tk.Button(btns, text="Ausgewählte speichern" if batch else "Speichern",
+                             bg="#00cc44", fg="#000000", font=('Helvetica', 9, 'bold'),
+                             width=20, default="active", command=on_save)
+        save_btn.pack(side="right", padx=6)
+
+        refresh_all()
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        # Enter löst den Knopf mit dem Fokus aus (Abbrechen, Speicherort
+        # ändern…, Haken); nur sonst gilt Enter als »Speichern«.
+        dlg.bind("<Return>", lambda e: e.widget.invoke()
+                 if isinstance(e.widget, (tk.Button, tk.Checkbutton)) else on_save())
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        save_btn.focus_set()
+        self.root.wait_window(dlg)
+        return result['merge']
+
+    def _log_comp(self, plan, comp):
+        """Dopplungen einer gespeicherten Liste ins Protokoll schreiben."""
+        lab = plan['label']
+        if comp['dup_lossless']:
+            how = ("verlustfrei zusammengeführt" if comp['merge_dups']
+                   else "NICHT zusammengeführt (abgewählt)")
+            self.log(f"{lab}: {len(comp['dup_lossless'])} doppelte Einträge {how}: "
+                     + ", ".join(f"{k[1]}-{k[2]}" for k, _ in comp['dup_lossless'][:40])
+                     + (" …" if len(comp['dup_lossless']) > 40 else ""))
+        for k, n, fields in comp['dup_conflicts'][:40]:
+            self.log(f"   ⚠ {lab} Stelle {k[1]} / Pos. {k[2]}: {n}× mit abweichenden "
+                     f"Angaben ({', '.join(self._field_label(f) for f in fields)}) – "
+                     "bitte von Hand prüfen.")
+        if len(comp['dup_conflicts']) > 40:
+            self.log(f"   … und {len(comp['dup_conflicts']) - 40} weitere")
+        for k, fields in comp['src_conflicts'][:40]:
+            self.log(f"   ⚠ {lab} Stelle {k[1]} / Pos. {k[2]}: bisherige Liste weicht von "
+                     f"der Zieldatei ab ({', '.join(self._field_label(f) for f in fields)}); "
+                     "Angaben der Zieldatei behalten.")
+
+    def _write_csv(self, plan, comp):
+        """Schreibt die Fotoliste (cp1252, ';'). Vor JEDEM Überschreiben wird
+        der bisherige Inhalt gesichert: als '.bak' neben der Liste und im
+        Speicher für UNDO (so führt UNDO genau auf den Stand vor diesem
+        Speichern zurück, samt zwischenzeitlicher Excel-Nachträge). Geschrieben
+        wird über eine Zwischendatei: ein Fehler hinterlässt nie eine halbe
+        Liste. Gibt (ok, Fehlertext) zurück."""
+        out_path = plan['target']
+        buf = io.StringIO(newline='')
+        # Eine Excel-Zeile 'sep=,' oder 'sep=<Tab>' muss zum Trennzeichen
+        # passen, mit dem jetzt geschrieben wird (';').
+        buf.write(re.sub(r'^sep=.(?=\r?\n|\r|$)', 'sep=;', comp.get('preamble', ''),
+                         flags=re.IGNORECASE))
+        w = csv.writer(buf, delimiter=';', lineterminator='\r\n')
+        w.writerow([self._field_label(f) for f in comp['fields']])
+        for r in comp['rows']:
+            w.writerow([r.get(f, '') for f in comp['fields']])
+        data = buf.getvalue().encode('cp1252', errors='replace')
+
+        mode, b_path, prev = 'new', None, None
+        if os.path.exists(out_path):
+            if not os.access(out_path, os.W_OK):
+                self.log(f"Schreibgeschützt, nichts gespeichert: {out_path}")
+                return False, (f"'{os.path.basename(out_path)}' ist schreibgeschützt "
+                               "(Dateieigenschaften) – bitte Schreibschutz aufheben.")
+            mode, b_path = 'overwrite', out_path + '.bak'
+            try:
+                with open(out_path, 'rb') as f:
+                    prev = f.read()
+                # Eine schreibgeschützte alte .bak darf das Sichern nicht blockieren;
+                # copyfile übernimmt den Schreibschutz der Liste nicht mit.
+                if os.path.exists(b_path) and not os.access(b_path, os.W_OK):
+                    os.chmod(b_path, stat.S_IWRITE | stat.S_IREAD)
+                shutil.copyfile(out_path, b_path)
+            except Exception as e:
+                self.log(f"Sicherung fehlgeschlagen, nichts gespeichert: {e}")
+                if isinstance(e, PermissionError):
+                    return False, (f"Sicherung '{os.path.basename(b_path)}' oder Liste "
+                                   "gesperrt – vermutlich in Excel geöffnet. Bitte schließen "
+                                   "und erneut versuchen.")
+                return False, f"Sicherung fehlgeschlagen ({e})"
+        tmp = out_path + '.tmp'
+        try:
+            os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, out_path)
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            self.log(f"Fehler beim Speichern von {out_path}: {e}")
+            if isinstance(e, PermissionError):
+                return False, ("Datei ist gesperrt – vermutlich in Excel geöffnet. "
+                               "Bitte schließen und erneut versuchen.")
+            return False, str(e)
+        action = {'mode': mode, 'target': out_path, 'backup': b_path,
+                  'prev': prev, 'written': data}
+        self._remember_target(plan, action)
+        self.last_update_actions.append(action)
+        self.log(f"Gespeichert: {out_path}")
+        return True, None
+
+    def _csv_save_flow(self, data_list, batch, list_path=None, update=False):
+        """Fotoliste(n) vorbereiten, im Speichern-Dialog bestätigen lassen und
+        erst dann schreiben. Einzel: Der Dialog erscheint immer, der
+        Speicherort ist wählbar. Batch: EIN Dialog für alle Maßnahmen; gibt es
+        nirgends etwas zu ergänzen, entfällt er. update=True (Aktion 5): Ohne
+        vorhandene Liste wird eine neue nur nach ausdrücklichem Haken angelegt.
+        Gibt Ergebniszeilen für die Abschlussmeldung zurück."""
+        notes, plans = [], []
+        for d in data_list:
+            plan = self._build_csv_plan(d, list_path=list_path)
+            if plan is None:
+                notes.append(f"{(d.get('raw_act') or '').strip() or '?'}: "
+                             "Aktivität oder Ordner ungültig – übersprungen.")
+                continue
+            if not plan['fresh']:
+                notes.append(f"{plan['label']}: keine passenden Fotos gefunden – "
+                             "keine Liste geschrieben.")
+                continue
+            if update and not plan['source']:
+                plan['selected'] = False
+            plans.append(plan)
+
+        def up_to_date_note(plan, comp):
+            note = (f"{plan['label']}: Fotoliste ist aktuell – nichts zu ergänzen "
+                    f"({os.path.basename(plan['target'])})")
+            if comp['dup_conflicts']:
+                note += (f", aber {self._n(len(comp['dup_conflicts']), 'widersprüchlicher Doppel-Eintrag', 'widersprüchliche Doppel-Einträge')}"
+                         " – bitte von Hand prüfen (siehe Protokoll)")
+            return note + "."
+
+        if plans and batch:
+            for plan in plans:
+                plan['_comp'] = self._compose_csv(plan, True)
+                if not plan['_comp']['changed']:
+                    plan['selected'] = False
+            if not any(p['_comp']['changed'] or p['_comp']['error'] for p in plans):
+                for p in plans:
+                    self._log_comp(p, p['_comp'])
+                    notes.append(up_to_date_note(p, p['_comp']))
+                plans = []
+
+        if plans:
+            merge = self._ask_csv_save(plans, batch)
+            if merge is None:
+                notes.append("Speichern abgebrochen – keine Fotoliste geschrieben.")
+                plans = []
+            for plan in plans:
+                lab = plan['label']
+                comp = self._compose_csv(plan, merge)
+                name = os.path.basename(plan['target'])
+                if comp['error']:
+                    notes.append(f"{lab}: NICHT gespeichert – {comp['error']}")
+                    continue
+                if not comp['changed']:
+                    self._log_comp(plan, comp)
+                    self._remember_target(plan)  # selbst gewählte, aktuelle Liste merken
+                    notes.append(up_to_date_note(plan, comp))
+                    continue
+                if not plan['selected']:
+                    notes.append(f"{lab}: nicht gespeichert (nicht angehakt).")
+                    continue
+                self._log_comp(plan, comp)
+                ok, err = self._write_csv(plan, comp)
+                if not ok:
+                    notes.append(f"{lab}: NICHT gespeichert – {err}")
+                    continue
+                extra = ""
+                if comp['n_carried']:
+                    extra += f", {self._n(comp['n_carried'], 'Eintrag', 'Einträge')} übernommen"
+                if merge and comp['dup_lossless']:
+                    extra += f", {len(comp['dup_lossless'])} Doppel-Einträge zusammengeführt"
+                if comp['dup_conflicts']:
+                    extra += (f", {len(comp['dup_conflicts'])} widersprüchliche "
+                              "Doppel-Einträge bitte prüfen")
+                notes.append(f"{lab}: {self._n(comp['n_new'], 'neuer Eintrag', 'neue Einträge')}"
+                             f"{extra} → {name}")
+        for n in notes:
+            self.log(f"Fotoliste – {n}")
+        return notes
 
     # --- UNDO, LOG & EXTRA ---
-    def undo_last_action(self):
-        u_msg = []
-        for a in self.last_update_actions:
-            if a['mode'] == 'new' and os.path.exists(a['target']):
-                os.remove(a['target'])
-                u_msg.append(f"Erstellte Datei '{os.path.basename(a['target'])}' gelöscht.")
-            elif a['mode'] == 'overwrite' and a['backup'] and os.path.exists(a['backup']):
-                if os.path.exists(a['target']):
-                    os.remove(a['target'])
-                shutil.move(a['backup'], a['target'])
-                u_msg.append("Überschriebene Original-CSV aus '.bak' wiederhergestellt.")
-        self.last_update_actions.clear()
-
-        u_c = 0
-        if self.rename_history:
-            for t, s in list(self.rename_history.items()):
-                if os.path.exists(t):
-                    try:
-                        os.makedirs(os.path.dirname(s), exist_ok=True)
-                        shutil.move(t, s)
-                        u_c += 1
-                    except:
-                        pass
-            self.rename_history.clear()
-            if u_c > 0:
-                u_msg.append(f"{u_c} Dateien in Ursprungszustand versetzt.")
-
-        if not u_msg:
-            messagebox.showinfo("Undo", "Nichts zum Rückgängig machen.")
+    def _remember_target(self, plan, action=None):
+        """Über »Speicherort ändern…« gewählte Liste für diesen Quellordner
+        merken (auch wenn sie schon aktuell war). UNDO stellt den vorigen
+        Merk-Zustand wieder her; ohne Speichervorgang gibt es dafür einen
+        eigenen UNDO-Eintrag."""
+        if not plan.get('user_target'):
+            return
+        key = plan['pin_key']
+        pin = (key, self._chosen_targets.get(key))
+        self._chosen_targets[key] = plan['target']
+        if action is not None:
+            action['pin'] = pin
         else:
+            self.last_update_actions.append({'mode': 'pin', 'target': plan['target'],
+                                             'pin': pin})
+
+    def _begin_undo_group(self):
+        """Jede Aktion (1–5) ist ein UNDO-Schritt: Umbenennungen und
+        gespeicherte Listen dieser Aktion landen in einer eigenen Gruppe."""
+        grp = {'renames': {}, 'lists': []}
+        self.undo_stack.append(grp)
+        self.rename_history = grp['renames']
+        self.last_update_actions = grp['lists']
+
+    def undo_last_action(self):
+        """Nimmt die LETZTE Aktion zurück (erneut drücken = die davor).
+        Listen bekommen den Stand unmittelbar vor diesem Speichern zurück; wurde
+        eine Liste seitdem verändert (z.B. in Excel), wird der jetzige Stand
+        vorher als '<Datei>.vor-undo' gesichert. Gesperrte Dateien (in Excel
+        geöffnet) werden gemeldet und bleiben für einen neuen Versuch vorgemerkt."""
+        while self.undo_stack and not (self.undo_stack[-1]['renames']
+                                       or self.undo_stack[-1]['lists']):
+            self.undo_stack.pop()
+        if not self.undo_stack:
+            messagebox.showinfo("Undo", "Nichts zum Rückgängig machen.")
+            return
+        grp = self.undo_stack[-1]
+        u_msg, fails = [], []
+
+        def free_name(path, tag):
+            """Freier Name neben path ('…tag', '…tag-2', …) – nie überschreiben."""
+            stem, ext = os.path.splitext(path) if tag.startswith(' ') else (path, '')
+            cand, n = f"{stem}{tag}{ext}", 2
+            while os.path.exists(cand):
+                cand, n = f"{stem}{tag}-{n}{ext}", n + 1
+            return cand
+
+        def restore_pin(a):
+            if a.get('pin'):
+                key, before = a['pin']
+                if before is None:
+                    self._chosen_targets.pop(key, None)
+                else:
+                    self._chosen_targets[key] = before
+
+        for a in reversed(list(grp['lists'])):
+            name = os.path.basename(a['target'])
+            if a['mode'] == 'pin':  # nur ein gemerkter Speicherort
+                restore_pin(a)
+                grp['lists'].remove(a)
+                u_msg.append(f"Gemerkter Speicherort '{name}' vergessen.")
+                continue
+            tmp = a['target'] + '.tmp'
+            keep_tmp = None
+            try:
+                cur = None
+                if os.path.exists(a['target']):
+                    with open(a['target'], 'rb') as f:
+                        cur = f.read()
+                if cur is not None and cur != a['written']:
+                    # Fremdänderung erst vorläufig sichern; endgültig erst, wenn
+                    # das Zurücksetzen geklappt hat (sonst bei jedem Versuch eine
+                    # weitere Kopie)
+                    keep_tmp = free_name(a['target'], '.vor-undo.tmp')
+                    with open(keep_tmp, 'wb') as f:
+                        f.write(cur)
+                if a['mode'] == 'new':
+                    if cur is not None:
+                        os.remove(a['target'])
+                    done = f"Erstellte Datei '{name}' gelöscht."
+                else:
+                    with open(tmp, 'wb') as f:
+                        f.write(a['prev'])
+                    os.replace(tmp, a['target'])
+                    done = f"'{name}' auf den Stand vor dem Speichern zurückgesetzt."
+                if keep_tmp:
+                    keep = free_name(a['target'], '.vor-undo')
+                    os.replace(keep_tmp, keep)
+                    keep_tmp = None
+                    u_msg.append(f"'{name}' wurde nach dem Speichern verändert – dieser "
+                                 f"Stand ist gesichert als '{os.path.basename(keep)}'.")
+                u_msg.append(done)
+                restore_pin(a)
+                grp['lists'].remove(a)
+            except OSError as e:
+                fails.append(f"'{name}': {e}" + (
+                    " – vermutlich in Excel geöffnet; bitte schließen und UNDO erneut drücken."
+                    if isinstance(e, PermissionError) else ""))
+            finally:
+                for leftover in (tmp, keep_tmp):
+                    if leftover and os.path.exists(leftover):
+                        try:
+                            os.remove(leftover)
+                        except OSError:
+                            pass
+
+        u_c, missing = 0, 0
+        for t, s in reversed(list(grp['renames'].items())):
+            try:
+                if not os.path.exists(t):
+                    missing += 1  # inzwischen verschoben/gelöscht – nichts zurückzusetzen
+                else:
+                    os.makedirs(os.path.dirname(s), exist_ok=True)
+                    dest = s
+                    if os.path.exists(s):
+                        # Unter dem alten Namen liegt inzwischen eine ANDERE Datei
+                        # (z.B. ein neues Foto '5-10.jpg') – nie überschreiben.
+                        dest = free_name(s, ' (UNDO)')
+                        u_msg.append(f"'{os.path.basename(s)}' war schon wieder belegt – "
+                                     f"zurückgelegt als '{os.path.basename(dest)}'.")
+                    shutil.move(t, dest)
+                    u_c += 1
+                del grp['renames'][t]
+            except OSError as e:
+                fails.append(f"'{os.path.basename(t)}': {e}")
+        if u_c > 0:
+            u_msg.append(f"{u_c} Dateien in Ursprungszustand versetzt.")
+        if missing:
+            u_msg.append(f"{self._n(missing, 'Foto war', 'Fotos waren')} nicht mehr am "
+                         "erwarteten Ort (inzwischen verschoben oder gelöscht) – "
+                         "nicht zurückgesetzt.")
+        if not grp['lists'] and not grp['renames']:
+            self.undo_stack.pop()
+
+        if u_msg:
             msg = "Undo ausgeführt:\n- " + "\n- ".join(u_msg)
-            self.log(msg)
-            messagebox.showinfo("Undo", msg)
+        elif fails:
+            msg = "Undo NICHT ausgeführt."
+        else:
+            msg = "Undo: Es gab nichts mehr zurückzusetzen."
+        if fails:
+            msg += "\n\nNicht möglich:\n- " + "\n- ".join(fails)
+        self.log(msg)
+        (messagebox.showwarning if fails else messagebox.showinfo)("Undo", msg)
 
     def log(self, m):
         self.txt_log.insert(tk.END, m + "\n")
@@ -1480,9 +2603,11 @@ Dokumentationsvorgaben (WNK-Format / Dokuprüfer).
    können individuelle Fotografen vergeben werden.
 4. Zielordner: Alle fertigen Bilder landen einheitlich in 'Aktivität_Fotos'
    (z.B. OV_2021_1034_Fotos).
-5. Aktionen: Wähle die passende Aktion. Im Batch-Modus werden Nachfragen beim
-   Aktualisieren bestehender Listen zum Zeitsparen automatisch mit "Ersetzen"
-   (inkl. Backup) beantwortet.
+5. Aktionen: Wähle die passende Aktion. Bevor eine Fotoliste gespeichert wird,
+   erscheint immer der Speichern-Dialog: im Einzel-Modus mit frei wählbarem
+   Speicherort, im Batch-Modus als Übersicht aller Maßnahmen zum Abhaken.
+   Jede Kombination aus Stelle und Position steht nur EINMAL in der Liste,
+   auch wenn man denselben Ordner mehrfach bearbeitet.
 
 Viel Erfolg! --Peter
 
@@ -1535,7 +2660,7 @@ im Einzel- wie im Batch-Modus.
   Benennt Rohfotos um, schiebt alles in den Abgabeordner und erstellt die CSV.
   Existiert bereits eine Fotoliste, werden nur fehlende Einträge ergänzt
   (Kommentare bleiben erhalten). Bereits verarbeitete Fotos werden nicht
-  erneut angefasst.
+  erneut angefasst. Gespeichert wird erst nach dem Speichern-Dialog (4a).
 
 [2. Nur umbenennen!]
   Sucht nach Roh-Mustern ('4-5.jpg') und benennt diese vor Ort um.
@@ -1549,15 +2674,75 @@ im Einzel- wie im Batch-Modus.
   Existiert bereits eine Fotoliste, werden nur fehlende Einträge ergänzt.
 
 [5. Vorhandene Digitalbildliste aktualisieren]
-  Wähle im Einzelmodus eine bestehende CSV im Explorer aus. Das Programm fügt
-  neue Fotos aus den Ordnern nahtlos ein. Es fragt dich danach, ob du die
-  gewählte Datei ersetzen möchtest (wobei alle Kommentare erhalten bleiben!)
-  oder neu benennst. Im Batch-Modus geschieht das Ersetzen (inkl. Erstellung
-  von Sicherheitskopien) vollautomatisch für alle gefundenen Maßnahmen.
+  Wähle im Einzelmodus eine bestehende CSV im Explorer aus (vorgeschlagen wird
+  die automatisch gefundene). Das Programm ergänzt neue Fotos; alle
+  vorhandenen Einträge und Kommentare bleiben erhalten. Im Speichern-Dialog
+  bestimmst du danach, wohin gespeichert wird. Im Batch-Modus sucht das
+  Programm die Listen aller Maßnahmen selbst und zeigt sie gesammelt zur
+  Bestätigung an; Maßnahmen ohne vorhandene Liste werden nur neu angelegt,
+  wenn du sie anhakst.
 
 [Letzte Aktion rückgängig machen (UNDO)]
-  Macht Dateibewegungen rückgängig und löscht/restauriert die veränderten CSVs
-  mithilfe von Sicherheitskopien (.bak).
+  Nimmt die jeweils LETZTE Aktion zurück (erneut klicken = die davor):
+  Dateibewegungen werden rückgängig gemacht, neu angelegte Listen gelöscht,
+  ergänzte Listen bekommen den Stand unmittelbar vor dieser Aktion zurück –
+  inklusive Nachträgen, die du vorher in Excel gemacht hast. Wurde eine Liste
+  NACH dem Speichern noch verändert, wird dieser Stand vorher als
+  '<Liste>.vor-undo' gesichert (bei mehreren '.vor-undo-2' usw. – nie
+  überschrieben). Liegt unter dem alten Rohnamen inzwischen ein ANDERES Foto,
+  wird das zurückgeholte als '… (UNDO).jpg' daneben gelegt – es wird nichts
+  überschrieben. Ist eine Liste in Excel geöffnet, meldet das Programm das;
+  nach dem Schließen UNDO einfach erneut drücken.
+  Zusätzlich liegt nach jedem Ergänzen eine Sicherheitskopie (.bak) neben
+  der Liste.
+
+-------------------------------------------------------------------
+4a. FOTOLISTE SPEICHERN & DOPPELTE EINTRÄGE
+-------------------------------------------------------------------
+  * Jede Kombination aus Aktivität, Stelle und Position steht höchstens
+    EINMAL in der Fotoliste. Gibt es mehrere Fotos derselben Stelle/Position
+    (z.B. ..._0005_010.jpg und ..._0005_010_A.jpg, oder ein liegengebliebenes
+    Rohfoto '5-10.jpg' neben der umbenannten Kopie), entsteht nur ein Eintrag.
+    Welche Fotos betroffen sind, steht im Protokoll.
+  * Wird derselbe Ordner erneut bearbeitet, kommen nur Stellen/Positionen
+    hinzu, die in der Liste noch fehlen.
+  * Unterordner im fertigen Fotoordner (z.B. '..._Fotos/aussortiert') werden
+    weder verschoben noch in die Liste aufgenommen. Ein Rohfoto, das direkt
+    im fertigen Fotoordner liegt, wird dort umbenannt.
+  * Enthält eine vorhandene Liste schon doppelte Einträge (z.B. aus älteren
+    Programmversionen), werden sie auf Wunsch verlustfrei zusammengeführt:
+    leere Felder werden aus dem Doppel aufgefüllt. Widersprechen sich die
+    Angaben (z.B. zwei verschiedene Kommentare), bleiben beide Zeilen stehen
+    und werden im Dialog und im Protokoll zum Prüfen genannt.
+  * Speichern-Dialog: zeigt Zieldatei, Zahl der neuen Einträge und gefundene
+    Dopplungen. Über »Speicherort ändern…« lässt sich jede Liste woanders
+    speichern. Wählst du eine vorhandene Fotoliste als Ziel, wird sie
+    ergänzt, nicht ersetzt. Vor jedem Überschreiben wird eine Sicherung
+    (.bak) angelegt.
+  * Batch-Modus: EIN Dialog für alle Maßnahmen, jede einzeln abhakbar.
+    Würden zwei Maßnahmen in dieselbe Datei schreiben, wird das angezeigt
+    und das Speichern verhindert, bis es aufgelöst ist. Ist nirgends etwas
+    zu ergänzen, erscheint kein Dialog.
+  * Batch-Modus, mehrere Ordner je Maßnahme: Der Block zeigt die
+    zusätzlich gefundenen Ordner einzeln zum Abwählen an. Eindeutige Kopien
+    ('… - Kopie', '(2)', 'Backup', oder ein anderer Ordner der Maßnahme mit
+    angehängtem '_alt'/'_Sicherung') sind vorab abgewählt – ihre Fotos würden
+    sonst als _A-Dubletten umbenannt. Ortsnamen wie 'Morschenich-Alt' oder
+    'Hangsicherung' gelten nicht als Kopie. Abgewählte Ordner nennt die
+    Abschlussmeldung mit der Zahl ihrer Fotos.
+  * Die vorhandene Liste wird im Ordner der Maßnahme bis drei Ebenen tief
+    gesucht (z.B. Abgabe/..._Stellenkatalog_und_Listen/), ebenso in
+    Nachbarordnern derselben Maßnahme (z.B. '..._Abgabe' neben dem
+    Rohfoto-Ordner). Fund-, SfM- (auch 'SfM-Fotoliste'), Zeichnungs- oder
+    Stellenlisten und fremde leere Vorlagen werden nie als Fotoliste
+    genommen, Kopien ('... - Kopie.csv', 'NEU_...', Ordner 'Sicherung') nur,
+    wenn es keine bessere gibt. Wurde in dieser Sitzung an einem selbst
+    gewählten Ort gespeichert, wird diese Liste weitergeführt.
+  * Vorhandene Listen werden verlustfrei gelesen: Excel-Zeile 'sep=;' und
+    Titelzeilen über der Kopfzeile, doppelte oder leere Spaltennamen, eigene
+    Zusatzspalten, ';' im Kommentar ohne Anführungszeichen, UTF-8 und
+    Tausenderpunkte ('1.000') bleiben erhalten bzw. werden richtig erkannt.
+    Notiz- und Trennzeilen ohne Nummer bleiben an ihrem Platz.
 
 -------------------------------------------------------------------
 5. ENTWICKLER-TIPPS (Code-Anpassungen)
